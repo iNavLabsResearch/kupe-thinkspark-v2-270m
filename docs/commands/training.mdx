@@ -1,0 +1,85 @@
+---
+title: "Training"
+description: "Phase 1 (modality alignment) then Phase 2 (referee fine-tune)"
+icon: "brain"
+---
+
+<Warning>
+Set `HF_TOKEN` first — Gemma-3-270M weights are gated on Hugging Face.
+```bash
+export HF_TOKEN=hf_...
+```
+</Warning>
+
+<Steps>
+
+<Step title="Phase 1 — modality alignment (LoRA)">
+Needs the Phase-1 frame shards built from the free open corpora (see
+[Preprocessing](/commands/preprocessing)).
+
+```bash
+python scripts/06_train_phase1.py --config configs/train_phase1.yaml \
+    --frames "data/frames_phase1/*.jsonl"
+```
+
+**2×T4 DDP:**
+```bash
+torchrun --nproc_per_node=2 scripts/06_train_phase1.py \
+    --config configs/train_phase1.yaml --frames "data/frames_phase1/*.jsonl"
+```
+
+Trains $\mathcal{L}_{P1} = \mathcal{L}_{\text{align}} + 0.3 \cdot \mathcal{L}_{\text{vap}}$
+with LoRA (r=16, alpha=32), LR 2e-4, 1–2 epochs. Checkpoints land in
+`artifacts/thinkspark-v2-350m/phase1/`.
+</Step>
+
+<Step title="Phase 2 — referee fine-tune (full bf16)">
+```bash
+python scripts/07_train_phase2.py --config configs/train_phase2.yaml \
+    --frames "data/frames/*.jsonl" \
+    --init artifacts/thinkspark-v2-350m/phase1/final/model.pt
+```
+
+No Phase-1 checkpoint yet? Skip `--init` and train Phase 2 from the base weights directly
+(works, just less sample-efficient):
+```bash
+python scripts/07_train_phase2.py --config configs/train_phase2.yaml --frames "data/frames/*.jsonl"
+```
+
+**2×T4 DDP:**
+```bash
+torchrun --nproc_per_node=2 scripts/07_train_phase2.py \
+    --config configs/train_phase2.yaml --frames "data/frames/*.jsonl"
+```
+
+Trains
+$\mathcal{L}_{P2} = 1.0\cdot\mathcal{L}_{\text{ctrl}}(\text{focal}) + 0.5\cdot\mathcal{L}_{\text{txt}} + 0.2\cdot\mathcal{L}_{\text{vap}}$,
+full fine-tune, LR 1e-4, 3–5 epochs. Checkpoints land in
+`artifacts/thinkspark-v2-350m/phase2/`.
+</Step>
+
+</Steps>
+
+## Watching it train
+
+Loss curves print to the terminal every `log_every` steps (default 20) using `plotext` if
+installed — no extra setup needed, works over SSH/Kaggle terminals:
+
+```
+[P2] epoch 1 step 340/2000 lr=8.4e-05 loss=1.2841 ctrl=0.712 txt=0.401 vap=0.171
+```
+
+## Tuning knobs (in `configs/train_phase{1,2}.yaml`)
+
+| Field | What it controls |
+|---|---|
+| `batch_size` / `grad_accum` | effective batch = batch_size × grad_accum (target 32–64) |
+| `use_lora` | `true` for Phase 1, `false` (full fine-tune) for Phase 2 |
+| `lambda_ctrl` / `lambda_txt` / `lambda_vap_p2` | Phase-2 loss weights (default 1.0/0.5/0.2) |
+| `focal_gamma` | focal-loss sharpness on the control head (default 2.0) |
+| `frame_drop_aug` | fraction of frames randomly dropped for robustness (default 5%) |
+| `ddp` | set `true` when launching with `torchrun` |
+
+<Card title="Next: Evaluation" icon="chart-line" href="/commands/evaluation">
+  Check the trained checkpoint against the Section-10 target table.
+</Card>

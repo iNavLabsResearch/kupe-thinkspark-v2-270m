@@ -1,0 +1,33 @@
+# ThinkSpark-v2-350M — end-to-end (data-gen + Phase-0/1/2 training + inference).
+# Tested target: Kaggle 2xT4 (CUDA), `conda activate llms`.
+#
+#   conda activate llms
+#   pip install -r requirements.txt
+#
+# On Kaggle, torch/transformers are usually preinstalled; pip will no-op or upgrade.
+
+# ---- core / training --------------------------------------------------------
+torch>=2.2                 # bf16 + CUDA on 2xT4 (MPS/CPU also work, slower)
+transformers>=4.44         # Gemma-3-270M (google/gemma-3-270m) + MimiModel (kyutai/mimi)
+accelerate>=0.33           # device placement / DDP helpers
+peft>=0.11                 # LoRA for Phase-1 (optional; only if use_lora=true)
+numpy>=1.26
+pyyaml>=6.0
+tqdm>=4.66
+plotext>=5.2               # terminal loss curves (nice on Kaggle)
+
+# ---- Phase-0 encode (Mimi) --------------------------------------------------
+torchaudio>=2.2            # f0 extraction (falls back to numpy autocorrelation)
+soundfile>=0.12            # robust wav io (optional; stdlib wave is the fallback)
+
+# ---- Phase-1 corpus fetch (scripts/P1_01_fetch_corpus.py) -------------------
+datasets>=2.19             # streams Common Voice / Kathbath / Shrutilipi / FLEURS / IndicTTS
+
+# ---- data generation --------------------------------------------------------
+openai>=1.40               # scenario + label writer + LLM-judge (any OpenAI-compatible endpoint)
+websocket-client>=1.7      # Soniox realtime TTS (user-audio synthesis)
+rich>=13.0                 # live dashboard for scripts/11_monitor.py (optional; plain-text fallback)
+
+# ---- Hugging Face -----------------------------------------------------------
+huggingface_hub>=0.23      # Gemma weights (needs HF_TOKEN) + dataset upload (script 13)
+pyarrow>=14.0               # Dataset Viewer parquet (Audio feature) — scripts/13_upload_hf.py

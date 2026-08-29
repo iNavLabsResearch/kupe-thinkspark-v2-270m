@@ -1,0 +1,55 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "ThinkSpark-v2-350M",
+  "description": "A tiny full-duplex floor-controller — theory and run-book.",
+  "colors": {
+    "primary": "#0B3D6B",
+    "light": "#4C86E0",
+    "dark": "#07203d"
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Literature",
+        "groups": [
+          {
+            "group": "Theory",
+            "pages": [
+              "literature/overview",
+              "literature/architecture",
+              "literature/data-theory",
+              "literature/training-theory",
+              "literature/evaluation-theory",
+              "literature/inference-theory"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Commands",
+        "groups": [
+          {
+            "group": "Run it, step by step",
+            "pages": [
+              "commands/setup",
+              "commands/data-generation",
+              "commands/phase1-corpus",
+              "commands/preprocessing",
+              "commands/training",
+              "commands/evaluation",
+              "commands/inference",
+              "commands/monitoring-cost"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "commands/cheatsheet"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

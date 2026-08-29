@@ -1,0 +1,62 @@
+---
+title: "Evaluation"
+description: "Check a trained checkpoint against the target table"
+icon: "chart-line"
+---
+
+## Run it
+
+```bash
+python scripts/08_evaluate.py --config configs/train_phase2.yaml \
+    --ckpt artifacts/thinkspark-v2-350m/phase2/final \
+    --frames "data/frames_val/*.jsonl"
+```
+
+<Note>
+Use a **held-out** frame shard here — never the exact shard(s) you trained on. A quick way
+to get one: hold back one or two of your `data/plan/plan_part*.jsonl` shards from
+generation/training entirely, or split off a fraction of scenarios before Phase-2 training.
+</Note>
+
+## What it prints
+
+```
+============================================================
+Evaluation — artifacts/thinkspark-v2-350m/phase2/final
+============================================================
+VAD-F1            : 0.87   (target >= 0.85)  PASS
+Barge-in F1       : 0.86   (target >= 0.85)  PASS
+Latency p50/p95   : 6.2 / 18.4 ms   (p95 target <= 40)
+
+per-flag F1:
+  LISTEN         P=0.96 R=0.97 F1=0.97
+  HOLD           P=0.91 R=0.89 F1=0.90
+  INCOMPLETE     P=0.82 R=0.79 F1=0.80
+  TURN_END       P=0.88 R=0.85 F1=0.86
+  BARGE_SOFT     P=0.79 R=0.74 F1=0.76
+  BARGE_HARD     P=0.88 R=0.86 F1=0.87
+  CONTINUE       P=0.83 R=0.81 F1=0.82
+  PREFETCH_LLM   P=0.71 R=0.68 F1=0.69
+  COMMIT_LLM     P=0.90 R=0.88 F1=0.89
+  CANCEL_LLM     P=0.77 R=0.70 F1=0.73
+  SILENCE_BREAK  P=0.93 R=0.89 F1=0.91
+
+wrote reports/eval.json
+```
+
+Also writes `reports/eval.json` (machine-readable) with every metric and a `passed` dict
+against the [target table](/literature/evaluation-theory).
+
+## What to check if a bar fails
+
+| Symptom | Likely cause | Where to look |
+|---|---|---|
+| `BARGE_HARD` low recall | too few real-barge examples, or focal `gamma`/`alpha` mistuned | `configs/train_phase2.yaml → focal_gamma`, re-check [distribution plan](/commands/data-generation) |
+| High false-barge rate | `barge_lookalike` bucket under-represented or mislabeled | `python scripts/05_validate_data.py` — check `barge_lookalike` resolves to `CONTINUE` |
+| `PREFETCH_LLM` low F1 | ambiguous near-end prosody in training data | inspect `prefetch` bucket scenarios in `data/scenarios/scenarios_all.jsonl` |
+| Latency p95 too high | not using bf16 / no grad-checkpointing at inference, or CPU-only | confirm `--device cuda` path is used; see [Inference](/commands/inference) |
+| VAD-F1 low | Phase-1 under-trained or free corpus not gender-balanced | revisit [Preprocessing](/commands/preprocessing) and Phase-1 epochs |
+
+<Card title="Next: Inference" icon="satellite-dish" href="/commands/inference">
+  Drive the live referee over a real frame stream.
+</Card>

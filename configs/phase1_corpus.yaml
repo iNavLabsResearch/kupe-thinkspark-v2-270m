@@ -1,0 +1,113 @@
+# ThinkSpark-v2-350M — Phase 1 free-audio corpus plan (Section 7).
+#
+# Phase 1 teaches Gemma-3-270M that a stream of Mimi audio tokens carries language +
+# prosody (close to the VAP task) — NOT full ASR, so we need far less than Whisper's
+# 680k h, but 100h across three languages (v1's number) is too thin to be robust.
+# Practical target from the guide: en 150h + hi 150h + gu 100-150h ~ 400-450h total.
+# Cost = INR 0 in data — only free Kaggle GPU time to encode to Mimi (script 00).
+#
+# Every source below is free/open (CC0 or a click-through research license) and
+# verified to exist on Hugging Face as of Aug 2026 — see README "Phase-1 sources" for
+# the full citation list and why each one is in the mix.
+
+target_hours:
+  en: 150
+  hi: 150
+  gu: 130          # PDF: gu 100-150h (scarcest of the three) — mid-high target, accept
+                   # less if sources run dry; the plan already up-weights gu sources
+
+# Aim for ~50/50 gender split (Section 7.3 — the codec does NOT remove bias, your data
+# distribution does). Only enforced where the source actually carries a gender field
+# (Common Voice does; AI4Bharat Kathbath/Shrutilipi mostly don't — see the README note).
+gender_balance: true
+
+sample_rate: 24000        # matches Mimi's operating rate (thinkspark.mimi_codec)
+min_clip_seconds: 1.5     # drop clips too short to carry a real training window
+max_clip_seconds: 20.0    # drop/trim clips longer than a Phase-2-sized window (Section 4)
+
+# --------------------------------------------------------------------------------- #
+# Sources per language. `weight` is this source's share of that language's
+# target_hours (weights within a language should sum to ~1.0). `gated: true` means the
+# dataset requires (a) an HF_TOKEN and (b) clicking "Agree" on the dataset's HF page
+# once, in a browser, before the token can pull it — the script gives a clear error
+# with the exact URL if you haven't done that yet.
+# --------------------------------------------------------------------------------- #
+sources:
+  en:
+    - id: common_voice
+      hf_dataset: mozilla-foundation/common_voice_17_0
+      hf_config: en
+      split: train
+      gated: true                  # https://huggingface.co/datasets/mozilla-foundation/common_voice_17_0
+      weight: 0.60
+      note: "huge speaker/gender/accent diversity (Section 7.2) — has an explicit gender field"
+    - id: fleurs
+      hf_dataset: google/fleurs
+      hf_config: en_us
+      split: train
+      gated: false
+      weight: 0.40
+      note: "clean, small, great HELD-OUT eval set — also usable for training volume"
+
+  hi:
+    - id: kathbath
+      hf_dataset: ai4bharat/Kathbath
+      hf_config: hindi
+      split: train
+      gated: false                 # CC0 — https://huggingface.co/datasets/ai4bharat/Kathbath
+      weight: 0.35
+      note: "1684h across 12 Indian languages, read+spontaneous, 203 districts"
+    - id: shrutilipi
+      hf_dataset: ai4bharat/Shrutilipi
+      hf_config: hindi
+      split: train
+      gated: false                 # https://huggingface.co/datasets/ai4bharat/Shrutilipi
+      weight: 0.30
+      note: "6400h+ mined from All India Radio news bulletins — natural prosody"
+    - id: common_voice
+      hf_dataset: mozilla-foundation/common_voice_17_0
+      hf_config: hi
+      split: train
+      gated: true
+      weight: 0.25
+      note: "speaker-invariance + explicit gender field"
+    - id: fleurs
+      hf_dataset: google/fleurs
+      hf_config: hi_in
+      split: train
+      gated: false
+      weight: 0.10
+      note: "clean baseline slice"
+
+  gu:
+    - id: kathbath
+      hf_dataset: ai4bharat/Kathbath
+      hf_config: gujarati
+      split: train
+      gated: false
+      weight: 0.35
+    - id: shrutilipi
+      hf_dataset: ai4bharat/Shrutilipi
+      hf_config: gujarati
+      split: train
+      gated: false
+      weight: 0.30
+    - id: common_voice
+      hf_dataset: mozilla-foundation/common_voice_17_0
+      hf_config: gu-IN
+      split: train
+      gated: true
+      weight: 0.20
+    - id: indictts
+      hf_dataset: SPRINGLab/IndicTTS_Gujarati
+      hf_config: null
+      split: train
+      gated: false
+      weight: 0.15
+      note: "IIT-Madras studio-quality baseline (Section 7.2's 'IIT-M IndicTTS')"
+
+# Optional, NOT in the default mix: ARTPARK-IISc/Vaani (31k h, 165 districts, huge
+# accent spread — Section 7.2's "Vaani"). It's enormous relative to what's needed here,
+# so it's left out of the default per-language targets above to keep Phase-1 storage/
+# bandwidth bounded on Kaggle. Add it as an extra source with a small `weight` (e.g.
+# 0.05-0.10) per language if you want more accent diversity and have the session budget.

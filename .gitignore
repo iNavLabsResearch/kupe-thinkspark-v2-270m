@@ -1,0 +1,50 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+
+# artifacts / checkpoints
+artifacts/
+reports/
+
+# SQLite run/cost tracking DB (thinkspark.db) + WAL sidecar files
+data/thinkspark_runs.db
+data/thinkspark_runs.db-wal
+data/thinkspark_runs.db-shm
+
+# generated data (keep the committed samples + .gitkeep)
+# short + extended + long were originally three separate corpora, generated into their
+# own plan/scenario/audio dirs, then merged (verified: 0 scenario_id / wav-filename
+# collisions) into ONE master corpus at data/scenarios/ + data/audio/. The per-band
+# plan dirs below are leftover from generation and can be deleted any time.
+data/plan/
+data/plan_extended/
+data/plan_long/
+data/scenarios/*.jsonl
+data/audio/*.wav
+data/audio/*.words.json
+data/encoded/*.npz
+data/frames/*.jsonl
+data/frames_phase1/
+data/frames_val/
+data/phase1_raw/
+data/thinkspark_runs_extended.db
+data/thinkspark_runs_extended.db-wal
+data/thinkspark_runs_extended.db-shm
+data/thinkspark_runs_long.db
+data/thinkspark_runs_long.db-wal
+data/thinkspark_runs_long.db-shm
+data/thinkspark_runs_extended_long.db
+data/thinkspark_runs_extended_long.db-wal
+data/thinkspark_runs_extended_long.db-shm
+# your own reference clips for voice cloning (scripts/15_create_voice_profiles.py) —
+# never commit raw voice audio; the resulting voice_profiles.json (just IDs) IS kept
+data/voice_refs/*.wav
+data/voice_refs/*.mp3
+data/voice_refs/*.m4a
+data/voice_refs/*.flac
+data/voice_refs/*.ogg
+!data/**/.gitkeep
+!data/samples/**

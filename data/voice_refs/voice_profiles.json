@@ -1,0 +1,144 @@
+{
+  "voices": [
+    {
+      "voice_id": "Nina",
+      "name": "Nina",
+      "gender": "female",
+      "description": "A bright, expressive female voice with youthful energy, natural rhythm, and a friendly tone that feels warm, engaging, and full of personality.",
+      "source": "default",
+      "added_at": "2026-08-28T20:10:46Z"
+    },
+    {
+      "voice_id": "Kayla",
+      "name": "Kayla",
+      "gender": "female",
+      "description": "A natural Gen Z female voice with a casual, low-key, and unpolished style.",
+      "source": "default",
+      "added_at": "2026-08-28T20:10:46Z"
+    },
+    {
+      "voice_id": "Nora",
+      "name": "Nora",
+      "gender": "female",
+      "description": "A young female voice with a casual, chatty style and an inquisitive tone.",
+      "source": "default",
+      "added_at": "2026-08-28T20:10:46Z"
+    },
+    {
+      "voice_id": "Imogen",
+      "name": "Imogen",
+      "gender": "female",
+      "description": "A clear British female voice with a sincere, down-to-earth, and professional style.",
+      "source": "default",
+      "added_at": "2026-08-28T20:10:46Z"
+    },
+    {
+      "voice_id": "Emma",
+      "name": "Emma",
+      "gender": "female",
+      "description": "A smooth, natural female voice with a relaxed pace, subtle warmth, and a contemporary tone that feels confident, personable, and easygoing.",
+      "source": "default",
+      "added_at": "2026-08-28T20:10:46Z"
+    },
+    {
+      "voice_id": "Daniel",
+      "name": "Daniel",
+      "gender": "male",
+      "description": "A rich, steady male voice with a polished tone, controlled pacing, and a reassuring presence that feels confident and mature.",
+      "source": "default",
+      "added_at": "2026-08-28T20:10:46Z"
+    },
+    {
+      "voice_id": "Bryce",
+      "name": "Bryce",
+      "gender": "male",
+      "description": "A deep, powerful male voice with strong projection and a commanding delivery.",
+      "source": "default",
+      "added_at": "2026-08-28T20:10:46Z"
+    },
+    {
+      "voice_id": "Emerson",
+      "name": "Emerson",
+      "gender": "male",
+      "description": "A warm, elegant male voice with a formal style and a slight American accent.",
+      "source": "default",
+      "added_at": "2026-08-28T20:10:46Z"
+    },
+    {
+      "voice_id": "Miles",
+      "name": "Miles",
+      "gender": "male",
+      "description": "A deep, smooth British male voice with a relaxed, intimate delivery.",
+      "source": "default",
+      "added_at": "2026-08-28T20:10:46Z"
+    },
+    {
+      "voice_id": "Alistair",
+      "name": "Alistair",
+      "gender": "male",
+      "description": "An older British male voice with a gentle, warm, and grandfatherly sound.",
+      "source": "default",
+      "added_at": "2026-08-28T20:10:46Z"
+    },
+    {
+      "voice_id": "c1b9bf8d-9142-46af-86e6-647bb60d062a",
+      "name": "hemali",
+      "gender": "female",
+      "source": "cloned",
+      "source_file": "female_hemali.mp3",
+      "content_hash": "0b098d5c1a1c879c",
+      "model_prepared": "tts-rt-v2",
+      "cloned_at": "2026-08-28T20:10:52Z"
+    },
+    {
+      "voice_id": "20d25610-d362-4d1e-b6d8-4bc4c39d3ec7",
+      "name": "hetal",
+      "gender": "female",
+      "source": "cloned",
+      "source_file": "female_hetal.mp3",
+      "content_hash": "edaa095d6937d0ea",
+      "model_prepared": "tts-rt-v2",
+      "cloned_at": "2026-08-28T20:10:57Z"
+    },
+    {
+      "voice_id": "c4ac0c84-c20d-4d3d-8b8a-74d9a64f99d7",
+      "name": "leela",
+      "gender": "female",
+      "source": "cloned",
+      "source_file": "female_leela.mp3",
+      "content_hash": "23b9cb13244e89da",
+      "model_prepared": "tts-rt-v2",
+      "cloned_at": "2026-08-28T20:11:02Z"
+    },
+    {
+      "voice_id": "9e2d5dd5-06f9-469e-b06e-13d1c14050b2",
+      "name": "pavni",
+      "gender": "female",
+      "source": "cloned",
+      "source_file": "female_pavni.mp3",
+      "content_hash": "e521c8736468f1ae",
+      "model_prepared": "tts-rt-v2",
+      "cloned_at": "2026-08-28T20:11:06Z"
+    },
+    {
+      "voice_id": "4228fa7f-e15a-4889-bcdb-eff06218e2d2",
+      "name": "payal",
+      "gender": "female",
+      "source": "cloned",
+      "source_file": "female_payal.mp3",
+      "content_hash": "ff5dacabe3c719b9",
+      "model_prepared": "tts-rt-v2",
+      "cloned_at": "2026-08-28T20:11:13Z"
+    },
+    {
+      "voice_id": "a5b5ef5e-15ef-4c31-bb6f-da4f0e437c13",
+      "name": "priya",
+      "gender": "female",
+      "source": "cloned",
+      "source_file": "female_priya.mp3",
+      "content_hash": "9fefcc6237991f55",
+      "model_prepared": "tts-rt-v2",
+      "cloned_at": "2026-08-28T20:11:18Z"
+    }
+  ]
+}

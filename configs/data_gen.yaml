@@ -1,0 +1,71 @@
+# ThinkSpark-v2-350M — data generation config (Sections 7-8)
+# Target: ~55 h of synthesised USER audio (agent side stays text + a state flag).
+# Secrets (OPENAI_API_KEY / SONIOX_API_KEY / HF_TOKEN) live in .env, never here.
+
+total_hours: 55.0
+avg_window_seconds: 22.0        # mean 20-30 s floor-control window
+
+# ---- LLM (scenario/label writer) via the OpenAI SDK -------------------------
+# Krutrim Gemma-4-31B — set OPENAI_API_KEY + OPENAI_BASE_URL in .env.
+# base_url lets the same code target OpenAI or any OpenAI-compatible endpoint
+# (Krutrim, Sarvam v2, vLLM, Together, Groq, a DeepSeek or Gemma-3 host...).
+llm_model: "gemma-4-31b-it"
+# llm_model: "gemma-4-26B-A4B-it"
+llm_base_url: "https://cloud.olakrutrim.com/v1"
+llm_temperature: 0.9
+llm_max_tokens: 1200            # PER SCENARIO budget; scaled by batch_size at call time
+llm_max_retries: 5
+
+# Concurrency = how many worker threads issue LLM calls in parallel (script 02).
+llm_concurrency: 30
+
+# Batched generation: ask for this many DISTINCT scenarios in ONE LLM call, instead of
+# one-at-a-time, for throughput. Keep <= 15 — bigger batches risk a small/fast model
+# (DeepSeek-flash-class, Gemma-3-27B-class) producing near-duplicate or drifting items.
+# Every item is still validated independently; only missing items are re-requested.
+# Set to 1 to fall back to fully single-scenario calls (slowest, most reliable).
+batch_size: 12
+
+# ---- LLM-judge (naturalness, Section 8.5) -----------------------------------
+judge_model: "gemma-4-31b-it"
+
+# ---- Soniox TTS (USER audio only) -------------------------------------------
+# Verified against a real working client (kupe-tts), not guessed — this is the TTS
+# endpoint, distinct from Soniox's STT endpoint (stt-rt.soniox.com).
+soniox_ws_url: "wss://tts-rt.soniox.com/tts-websocket"
+soniox_model: "tts-rt-v2"
+soniox_sample_rate: 24000
+soniox_max_retries: 5      # exponential backoff; a rate-limit-classified failure backs off harder
+# Soniox's real default account limit is 3 CONCURRENT STREAMS (soniox.com/docs/tts/rt/
+# limits-and-quotas). Raise only if your account has a higher limit.
+soniox_concurrency: 3
+
+# ---- Mimi codec (Phase 0 encode) --------------------------------------------
+mimi_repo: "kyutai/mimi"
+mimi_sample_rate: 24000
+
+# ---- generation sharding ----------------------------------------------------
+num_parts: 8                    # split generation across Kaggle sessions
+seed: 1234
+
+# ---- optional distribution overrides ----------------------------------------
+# Leave empty to use the canonical Section 8.1-8.2 shares baked into the code.
+behaviour_shares: {}
+language_shares: {}
+domain_shares: {}
+
+# ---- cost tracking (Section 13 budget) ---------------------------------------
+# Fill these in for whatever llm_model/provider you actually pick — pricing varies and
+# changes over time, so nothing is hard-coded. 0.0 = "cost unknown", not "free".
+#   DeepSeek V3-flash-class and Gemma-3-27B-class models are typically a few cents to
+#   low tens-of-cents per 1M tokens on most hosts — check your provider's pricing page.
+# Krutrim gemma-4-31b-it: ₹9 input / ₹33 output per 1M tokens (converted via inr_per_usd)
+llm_price_in_per_1m_usd: 0.108   # ~₹9 / 83 INR per USD
+llm_price_out_per_1m_usd: 0.398  # ~₹33 / 83 INR per USD
+soniox_price_per_hour_usd: 0.70  # ~verified against soniox.com/pricing (Section 13)
+inr_per_usd: 83.0                # only used for the printed INR budget summary
+budget_inr_target: 5000.0        # Section 13 target; scripts/11_monitor.py tracks % used
+
+# SQLite audit/cost-log DB (thinkspark.db). The JSONL shard stays the source of truth
+# for resume; this DB is a full log of every LLM/TTS call across all sessions.
+db_path: "data/thinkspark_runs.db"

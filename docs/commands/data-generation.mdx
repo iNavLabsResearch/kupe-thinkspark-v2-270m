@@ -1,0 +1,297 @@
+---
+title: "Data generation"
+description: "Generate → validate → render — simple by default, same as kupe-thinkspark/kupe-tts"
+icon: "database"
+---
+
+<Steps>
+
+<Step title="Generate scenarios with the LLM — just run it">
+```bash
+python scripts/02_generate_scripts.py --config configs/data_gen.yaml
+```
+That's the whole command. The balanced plan (Section 8.1–8.3 — gender-balanced,
+behaviour/language-balanced, ~9k scenarios ≈ 55h) is **auto-built on first run** — no
+separate step required — and every re-run **resumes automatically** toward the same
+target, the same simple "just run it" flow as the sibling `kupe-thinkspark`/`kupe-tts`
+generators.
+
+<Tip>
+Open a **second terminal** right now and run the [live monitor](/commands/monitoring-cost)
+— you'll watch cost, latency, and unit-eval pass/fail update in real time while this runs.
+</Tip>
+
+Prefer to inspect the plan explicitly first, or just like a visible step?
+```bash
+python scripts/01_plan_distribution.py --config configs/data_gen.yaml
+```
+```
+total scenarios : 9009
+by_behaviour     : {backchannel: 1081, barge_real: 720, barge_lookalike: 720, ...}
+by_language      : {hi: 2703, en: 2342, gu: 2162, hi_en_native: 901, gu_en_native: 901}
+by_gender        : {female: 4505, male: 4504}
+silent backchnl  : 381   (deliberate 'say nothing' cases)
+```
+Both call the exact same `thinkspark.distribution.write_plan()` — there is only ONE
+plan-building code path, so the numbers can never disagree between the two entry points.
+
+**Useful flags:**
+| Flag | Purpose |
+|---|---|
+| `--limit 20` | smoke-test a tiny amount before committing full budget |
+| `-j 10` / `--concurrency 10` | override `llm_concurrency` from the config for this run |
+| `--batch-size 1` | fall back to single-scenario calls if you see batching drift |
+| `--range 0:3000` | generate only global scenario indices [0,3000) — see below |
+| `--part 0` | advanced: split a big run across Kaggle sessions by hash-shard |
+| `--no-eval` | skip the automatic Section 8.5 corpus-wide check at the end |
+| `--cleanup` | delete the shard + cost DB (asks for confirmation first) |
+
+Splitting across Kaggle's 9h/session budget by hand still works exactly as before:
+```bash
+for part in 0 1 2 3 4 5 6 7; do
+  python scripts/02_generate_scripts.py --config configs/data_gen.yaml --part "$part"
+done
+```
+</Step>
+
+<Step title="Or split it yourself with --range — e.g. your 9009-scenario target">
+Prefer picking your own chunk sizes instead of the fixed 8 `--part` shards? `--range
+START:END` selects a slice of the **global scenario index space** (0 up to the plan's
+total — 9009 in the default config) and generates only that slice:
+
+```bash
+python scripts/02_generate_scripts.py --config configs/data_gen.yaml --range 0:3000
+python scripts/02_generate_scripts.py --config configs/data_gen.yaml --range 3000:6000
+python scripts/02_generate_scripts.py --config configs/data_gen.yaml --range 6000:9009
+```
+
+Run those three commands in any order, in any number of sessions, over any number of
+days — each one only writes what its slice still needs. All three write into the same
+`data/scenarios/scenarios_all.jsonl`, so by the time all three have run you have the
+full, identically-balanced 9009-scenario corpus — same file you'd get from one long
+`python scripts/02_generate_scripts.py` run.
+
+<Note>
+`--range` and `--part` are mutually exclusive (`--range` always operates on the full
+`plan.jsonl`, not a hash-based part). Passing both errors immediately, before any API
+call. An out-of-range end (past the plan's total) or a malformed `START:END` also errors
+immediately — the CLI validates before spending a single token.
+</Note>
+
+<Accordion title="Does re-running an overlapping or out-of-order range ever duplicate or lose scenarios?">
+No. Resumability is still governed by the same per-job count in the shard file
+(`_job_key` occurrences) regardless of which range triggered a scenario — a job's
+production is always clipped to its own target count, so running `--range 3000:6000`
+before `--range 0:3000`, or running overlapping ranges, converges to exactly the right
+total with zero duplicates and zero gaps. What *isn't* strictly guaranteed for
+out-of-order ranges is that a scenario's `global_index` recorded in SQLite
+(`scenario_registry` — see [Monitoring & cost](/commands/monitoring-cost)) exactly
+matches its conceptual position within that specific range slice; it's precise for the
+normal increasing-order workflow (0:3000, then 3000:6000, ...) and a best-effort label
+otherwise. The actual data — count, balance, no duplicates — is correct either way.
+</Accordion>
+</Step>
+
+<Step title="Longer user turns (~3-8 s extended, ~12-25 s long) — additive, merged before rendering">
+The default corpus produces short user turns (~1-2 s), which pin almost every training
+window at the ~1.3 s floor — the model then never sees the temporal dynamics that
+endpointing and turn-taking actually depend on. Add realistic longer turns **without
+touching your existing scenarios/audio** via two additive bands:
+- `configs/data_gen_extended.yaml` — `utterance_length: extended`, ~10-24 word / ~3-8 s
+  lines with natural mid-utterance pauses.
+- `configs/data_gen_long.yaml` — `utterance_length: long`, ~25-55 word / ~12-25 s
+  multi-sentence turns. The efficient way to add many **hours**: ~3× fewer clips than
+  extended for the same hours, so far fewer LLM calls and Soniox stream starts, and it
+  matches the guide's intended 20-30 s windows better. Best mixed in, not used alone —
+  it's not natural for terse behaviours (quick back-channel, one-word barge).
+
+```bash
+python scripts/02_generate_scripts.py --config configs/data_gen_extended.yaml \
+    --plan-dir data/plan_extended --out-dir data/scenarios_extended
+python scripts/02_generate_scripts.py --config configs/data_gen_long.yaml \
+    --plan-dir data/plan_long --out-dir data/scenarios_long
+```
+
+**Merge straight into the main corpus before rendering** — extended/long share identical
+Soniox/pricing settings with the main corpus, so there's no reason to track them
+separately at all. Verify no `scenario_id` collisions first, then fold them in:
+```bash
+python3 -c "
+import json
+a = {json.loads(l)['scenario_id'] for l in open('data/scenarios/scenarios_all.jsonl')}
+b = {json.loads(l)['scenario_id'] for l in open('data/scenarios_extended/scenarios_all.jsonl')}
+c = {json.loads(l)['scenario_id'] for l in open('data/scenarios_long/scenarios_all.jsonl')}
+print('collisions:', len((a&b)|(a&c)|(b&c)))"   # must print 0 before merging
+
+cat data/scenarios_extended/scenarios_all.jsonl data/scenarios_long/scenarios_all.jsonl \
+    >> data/scenarios/scenarios_all.jsonl
+```
+From here, render / encode / build frames with the **main config** — nothing
+extended/long-specific anymore (see the
+[cheatsheet](/commands/cheatsheet#1b-extended-3-8-s-long-12-25-s-turns-additive-merged-before-rendering)
+for the exact commands). A scenario already rendered (from any of the three original
+corpora) is skipped automatically; the dashboard's audio-hours meter reflects the TRUE
+whole-corpus total from the first line of output.
+
+<Tip>
+After generating, run `05_validate_data.py` on the merged file and check the new
+**`user_text words`** line — it prints mean/median word count and the implied seconds,
+so you can confirm the turns are actually long and not still one-liners.
+</Tip>
+
+<Note>
+**Sizing / reaching the 55 h target.** `total_hours` in each generation config is the
+size knob: `scenarios = total_hours * 3600 / avg_window_seconds`. Raise it for more data
+(the run is resumable, so bumping just tops up). Once merged, `total_hours` in
+`configs/data_gen.yaml` (55.0) is the TRUE overall target for the whole corpus — nothing
+else to keep in sync. `scripts/17_audio_summary.py` gives a real (rendered) + projected
+(word-count-based, for what isn't rendered yet) total any time, broken down by length
+band. Rendering **wall-time** is set by total audio seconds ÷ your concurrent-stream
+limit (~3), not by clip count — to speed that up, raise the Soniox Console concurrent
+limit and `soniox_concurrency`.
+</Note>
+
+**Once, unattended:**
+```bash
+bash scripts/18_render_all.sh                                          # stay attached
+nohup bash scripts/18_render_all.sh --quiet > render_all.log 2>&1 &     # run it, sleep
+python scripts/17_audio_summary.py                                     # check hours anytime
+```
+
+<Note>
+Why a whole separate corpus instead of one knob on the main config? So your already-
+generated short-turn data (and the money spent on it) is kept and reused as-is — short
+terse turns are a legitimate minority case. This is **additive coverage**, not a
+replacement. Short vs. extended jobs also carry distinct SQLite keys, so resume never
+mixes them up.
+</Note>
+</Step>
+
+<Step title="Unit-level eval happens automatically, per scenario">
+No command needed — every generated scenario is checked against Section 8.5 (schema,
+vocab, script) the instant it's produced. A fail gets a job-scoped `fail1`/`fail2`/…
+tag, prints live in the terminal, and the slot is automatically regenerated:
+```
+✗ unit-eval FAIL1 (endpoint_end/en): ["target[0]: unknown flag 'X'"] -> will regenerate
+↻ regenerating 1 scenario(s) for job endpoint_end|en|sales|female|0
+```
+When the whole run finishes, the corpus-wide Section 8.5 report (schema/vocab/script/
+balance/naturalness) runs once more automatically — unless you passed `--no-eval`.
+</Step>
+
+<Step title="Validate again any time (standalone)">
+```bash
+python scripts/05_validate_data.py --in data/scenarios/scenarios_all.jsonl
+```
+Add the LLM-judge naturalness pass (costs a little extra, samples 200 by default):
+```bash
+python scripts/05_validate_data.py --in data/scenarios/scenarios_all.jsonl --judge --judge-n 200
+```
+Exits non-zero if any **hard** bar fails (schema < 99%, vocab < 100%, script < 98%) — safe
+to wire into a CI-style check. Prints and saves a report to `reports/data_quality.txt`.
+</Step>
+
+<Step title="Clone your own voices — required before rendering">
+This project uses **only your own cloned voices** — `thinkspark/tts_soniox.py`'s
+`resolve_voice()` never falls back to Soniox's built-in catalog. Drop reference clips
+into `data/voice_refs/` named `female_<name>.wav` / `male_<name>.wav` (at least 1 per
+gender you plan to render), then:
+```bash
+python scripts/15_create_voice_profiles.py --config configs/data_gen.yaml --dry-run
+python scripts/15_create_voice_profiles.py --config configs/data_gen.yaml
+```
+This clones each clip via Soniox's real voice-cloning API, prepares it for the TTS
+model (recompute + poll), and writes `data/voice_refs/voice_profiles.json`. The render
+step below reads this automatically — nothing else to configure, and it **fails fast,
+before any API calls or spend**, if a gender it needs has zero voices.
+
+Soniox caps how many voices *one account* can have cloned (`soniox_max_cloned_voices`,
+default 20 total). Submit more clips than that and the script clones as many as the cap
+allows — split proportionally per gender — and fills the rest with named Soniox stock
+voices of the matching gender, so your final per-gender voice count still matches what
+you submitted. `--dry-run` shows the exact split first; `--cleanup` deletes every
+cloned voice (account + local) and resets the file. See `data/voice_refs/README.md` for
+the full naming rules and cap-splitting details.
+</Step>
+
+<Step title="Render user audio with Soniox TTS">
+```bash
+python scripts/03_render_user_audio.py --config configs/data_gen.yaml \
+    --in data/scenarios/scenarios_all.jsonl
+```
+Only the **user** line is synthesised — agent side stays text. Writes
+`data/audio/<scenario_id>.wav` + a `.words.json` sidecar with word/char timestamps.
+Resumable — scenarios whose wav already exists are skipped. Startup prints
+`voice profiles: N of your own cloned voice(s) loaded ...` — each render then
+deterministically rotates across your pool by a hash of the scenario text.
+
+Same live dashboard as scenario generation — rendered/skipped/failed, audio hours done
+vs. `total_hours`, cost spent/projected/**gap** vs. budget, throughput+ETA:
+```
+progress  ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░   32.0%  32/100  •  6.0/min  •  ETA 11m
+audio hours      0.027h / 55.0h target (0.0%)
+rendered/failed  30 ok  /  2 failed (1 rate-limited)
+spent                $0.0187
+projected total      $38.5000
+gap (left to spend)  $38.4813
+budget               63.9% of ₹5000 target (projected)
+```
+
+Renders `soniox_concurrency` (config, default **3** — Soniox's real default account-wide
+concurrent-stream limit) clips in parallel. A failure retries with exponential backoff
+automatically (`thinkspark.tts_soniox`); one classified as a rate limit (429 / "rate
+limit" / "quota" in the error) backs off harder and is tagged distinctly (⏳) so you can
+see whether to lower concurrency:
+```bash
+python scripts/03_render_user_audio.py --config configs/data_gen.yaml \
+    --in data/scenarios/scenarios_all.jsonl -j 2     # lower concurrency if rate-limited
+```
+
+**Faster, without loosening the rate limits.** Each worker thread reuses one persistent
+WebSocket connection across every scenario it renders instead of reconnecting each time
+(same 3-concurrent-stream cap, just no repeated handshake), and new streams are
+proactively paced under `soniox_max_stream_starts_per_min` (default 90, under Soniox's
+documented 100/minute) instead of only reacting to a 429 after the fact — a small evenly
+spread wait beats bursting past the limit and paying exponential backoff. See
+`thinkspark/tts_soniox.py`'s module docstring for details.
+
+<Note>
+`soniox_max_retries` (config, default 5) governs the backoff. Every attempt — ok, error,
+or rate-limited — is logged to SQLite (`tts_calls.status`), so
+`SELECT COUNT(*) FROM tts_calls WHERE status='rate_limited'` tells you exactly how often
+you hit the limit, even after the run finishes.
+</Note>
+
+**Cleanup** — delete every rendered wav + its `tts_calls`/`hf_sync` rows for a given
+`--audio-dir`, with an "are you sure?" confirmation first:
+```bash
+python scripts/03_render_user_audio.py --config configs/data_gen.yaml --cleanup
+```
+Scoped deliberately — leaves `llm_calls`/`unit_evals`/`scenario_registry` (scenario
+*generation*) untouched; use `02_generate_scripts.py --cleanup` for that instead.
+</Step>
+
+<Step title="Chart report + CSV export, any time">
+```bash
+python scripts/12_build_report.py --config configs/data_gen.yaml   # HTML: charts + progress
+python scripts/10_export_costs.py --config configs/data_gen.yaml   # CSV: every call, ever
+```
+See [Monitoring & cost](/commands/monitoring-cost) for what each one shows.
+</Step>
+
+</Steps>
+
+## Full copy-paste block
+
+```bash
+conda activate llms
+python scripts/02_generate_scripts.py --config configs/data_gen.yaml
+python scripts/05_validate_data.py --in data/scenarios/scenarios_all.jsonl --judge --judge-n 200
+python scripts/03_render_user_audio.py --config configs/data_gen.yaml --in data/scenarios/scenarios_all.jsonl
+python scripts/12_build_report.py --config configs/data_gen.yaml
+python scripts/10_export_costs.py --config configs/data_gen.yaml
+```
+
+<Card title="Next: Preprocessing" icon="waveform-lines" href="/commands/preprocessing">
+  Encode audio to Mimi tokens and build the per-frame training records.
+</Card>

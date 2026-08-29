@@ -1,0 +1,222 @@
+---
+title: "Full cheatsheet"
+description: "Every command, one page, copy-paste order"
+icon: "list"
+---
+
+<Warning>
+This is the full run-book, start to finish, in order. Each stage is resumable — a
+crash/stop is safe, just re-run the same command. Nothing here runs automatically; run
+each block, check the output, then move on.
+</Warning>
+
+## 0 · Setup (once)
+
+```bash
+conda activate llms
+pip install -r requirements.txt
+cp .env.example .env          # fill in OPENAI_API_KEY / SONIOX_API_KEY / HF_TOKEN
+python scripts/make_samples.py   # offline sanity check, no API keys needed
+```
+
+## 1 · Data generation
+
+```bash
+# in a SECOND terminal, while the next command runs:
+python scripts/11_monitor.py --config configs/data_gen.yaml
+
+# just run it — plan auto-built on first run, resumes automatically, unit-eval per scenario:
+python scripts/02_generate_scripts.py --config configs/data_gen.yaml
+
+python scripts/05_validate_data.py --in data/scenarios/scenarios_all.jsonl --judge --judge-n 200
+
+# required before rendering — no Soniox catalog fallback, at least 1 clip per gender:
+python scripts/15_create_voice_profiles.py --config configs/data_gen.yaml --dry-run
+python scripts/15_create_voice_profiles.py --config configs/data_gen.yaml
+
+python scripts/03_render_user_audio.py --config configs/data_gen.yaml --in data/scenarios/scenarios_all.jsonl
+python scripts/12_build_report.py --config configs/data_gen.yaml
+python scripts/10_export_costs.py --config configs/data_gen.yaml
+```
+
+Advanced: split across Kaggle's 9h/session budget by hand instead of one long run —
+```bash
+for part in 0 1 2 3 4 5 6 7; do
+  python scripts/02_generate_scripts.py --config configs/data_gen.yaml --part "$part"
+done
+```
+
+Or split by your own chunk sizes with `--range START:END` (global scenario index, e.g.
+0-9008 for a 9009 target) — any order, any number of sessions, all land in the same
+`scenarios_all.jsonl`:
+```bash
+python scripts/02_generate_scripts.py --config configs/data_gen.yaml --range 0:3000
+python scripts/02_generate_scripts.py --config configs/data_gen.yaml --range 3000:6000
+python scripts/02_generate_scripts.py --config configs/data_gen.yaml --range 6000:9009
+```
+
+### 1b · Extended (~3-8 s) + long (~12-25 s) turns — additive, merged before rendering
+
+The main corpus above produces short user turns (~1-2 s). To also teach realistic
+endpointing / mid-utterance pauses, generate longer-turn sets with
+`configs/data_gen_extended.yaml` / `configs/data_gen_long.yaml` (only change:
+`utterance_length`). Each writes its own scenario files — your main corpus is untouched:
+```bash
+python scripts/02_generate_scripts.py --config configs/data_gen_extended.yaml \
+    --plan-dir data/plan_extended --out-dir data/scenarios_extended
+python scripts/02_generate_scripts.py --config configs/data_gen_long.yaml \
+    --plan-dir data/plan_long --out-dir data/scenarios_long
+```
+
+**Merge straight into the main corpus before rendering** — no reason to track short/
+extended/long separately, they share identical Soniox/pricing settings. Verify no
+`scenario_id` collisions, then fold both into `data/scenarios/scenarios_all.jsonl`:
+```bash
+python3 -c "
+import json
+a = {json.loads(l)['scenario_id'] for l in open('data/scenarios/scenarios_all.jsonl')}
+b = {json.loads(l)['scenario_id'] for l in open('data/scenarios_extended/scenarios_all.jsonl')}
+c = {json.loads(l)['scenario_id'] for l in open('data/scenarios_long/scenarios_all.jsonl')}
+print('collisions:', len((a&b)|(a&c)|(b&c)))"   # must print 0 before merging
+
+cat data/scenarios_extended/scenarios_all.jsonl data/scenarios_long/scenarios_all.jsonl \
+    >> data/scenarios/scenarios_all.jsonl
+```
+Render with the **main config** from here — nothing extended/long-specific anymore:
+```bash
+python scripts/05_validate_data.py --in data/scenarios/scenarios_all.jsonl   # check "user_text words"
+python scripts/03_render_user_audio.py --config configs/data_gen.yaml \
+    --in data/scenarios/scenarios_all.jsonl --audio-dir data/audio
+```
+Resumable exactly as always — a scenario already rendered (from any of the three
+original corpora) is skipped. The dashboard's audio-hours meter now shows the TRUE
+whole-corpus total from the first line of output, not a per-corpus subset.
+
+**Render, unattended, once and sleep** — resumable, prints a real audio-hours summary by
+length band at the end:
+```bash
+bash scripts/18_render_all.sh                                          # stay attached
+nohup bash scripts/18_render_all.sh --quiet > render_all.log 2>&1 &     # run it, sleep
+```
+Check hours on disk any time, no need to wait for a render to finish:
+```bash
+python scripts/17_audio_summary.py
+```
+
+## 2 · Phase-1 corpus + preprocessing
+
+```bash
+pip install datasets soundfile
+export HF_TOKEN=hf_...     # also unlocks the gated Common Voice source (click "Agree" once on its HF page)
+
+# fetch the real, verified free corpus (streamed, stops per-source at target hours):
+python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml --dry-run
+python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml
+
+# encode + build frames, per language:
+for lang in en hi gu; do
+  python scripts/00_encode_audio.py --config configs/data_gen.yaml --wav-dir "data/phase1_raw/$lang" --out-dir data/encoded
+  python scripts/P1_02_build_frames.py --lang "$lang"
+done
+
+# Phase-2 (synthetic scenario audio):
+python scripts/00_encode_audio.py --config configs/data_gen.yaml --audio-dir data/audio --out-dir data/encoded
+python scripts/04_build_frames.py --in data/scenarios/scenarios_all.jsonl --frames-out data/frames/frames_all.jsonl
+```
+See [Phase-1 corpus](/commands/phase1-corpus) for the exact source list and why each is chosen.
+
+## 3 · Training
+
+```bash
+# Phase 1 — modality alignment (LoRA)
+python scripts/06_train_phase1.py --config configs/train_phase1.yaml --frames "data/frames_phase1/*.jsonl"
+
+# Phase 2 — referee fine-tune, warm-started from Phase 1
+python scripts/07_train_phase2.py --config configs/train_phase2.yaml --frames "data/frames/*.jsonl" \
+    --init artifacts/thinkspark-v2-350m/phase1/final/model.pt
+
+# 2xT4 DDP variant for either phase:
+torchrun --nproc_per_node=2 scripts/07_train_phase2.py --config configs/train_phase2.yaml --frames "data/frames/*.jsonl"
+```
+
+## 4 · Evaluation
+
+```bash
+python scripts/08_evaluate.py --config configs/train_phase2.yaml \
+    --ckpt artifacts/thinkspark-v2-350m/phase2/final --frames "data/frames_val/*.jsonl"
+```
+
+## 5 · Inference
+
+```bash
+python scripts/09_infer_demo.py --config configs/train_phase2.yaml \
+    --ckpt artifacts/thinkspark-v2-350m/phase2/final \
+    --encoded data/encoded/<scenario_id>.npz --agent-text "aapka EMI due hai"
+```
+
+## One-shot orchestration
+
+```bash
+bash scripts/run_all.sh
+```
+Runs every stage above in order, stage-by-stage comments included — meant to be **read**
+and executed piece by piece, not blindly piped through in one sitting.
+
+---
+
+## Every script, one line each
+
+| Script | Stage | What it does |
+|---|---|---|
+| `scripts/make_samples.py` | setup | offline sample scenarios + frames, no API needed |
+| `scripts/01_plan_distribution.py` | data-gen | optional explicit plan step (02 auto-builds it) |
+| `scripts/02_generate_scripts.py` | data-gen | LLM writes scenarios, batched, resumable, unit-eval per item |
+| `scripts/05_validate_data.py` | data-gen | corpus-wide schema/vocab/script/balance/naturalness gate |
+| `scripts/15_create_voice_profiles.py` | data-gen | required: clone your own voices (capped, over-cap filled by default stock voices); `--cleanup` to wipe |
+| `scripts/03_render_user_audio.py` | data-gen | Soniox TTS renders user audio + timestamps, concurrent, rate-limit-aware; `--cleanup` to wipe |
+| `scripts/11_monitor.py` | data-gen | live dashboard: cost, latency, unit-eval, pass/fail, ETA |
+| `scripts/12_build_report.py` | data-gen | HTML chart report — actual vs. target, cumulative spend |
+| `scripts/10_export_costs.py` | data-gen | CSV cost export from the SQLite log |
+| `scripts/P1_01_fetch_corpus.py` | phase1-corpus | streams Common Voice/Kathbath/Shrutilipi/FLEURS/IndicTTS |
+| `scripts/P1_02_build_frames.py` | phase1-corpus | manifest + Mimi shards → Phase-1 frame records |
+| `scripts/00_encode_audio.py` | preprocessing | wav → Mimi cb0 + energy + f0 |
+| `scripts/04_build_frames.py` | preprocessing | scenarios + timestamps → per-frame labels (Phase 2) |
+| `scripts/06_train_phase1.py` | training | modality alignment (LoRA) |
+| `scripts/07_train_phase2.py` | training | referee fine-tune (full bf16) |
+| `scripts/08_evaluate.py` | evaluation | Section-10 metrics against a held-out set |
+| `scripts/09_infer_demo.py` | inference | drives the live referee over a frame stream |
+| `scripts/14_cleanup_corrupt_audio.py` | data-gen | scan + remove corrupt/empty rendered audio |
+| `scripts/17_audio_summary.py` | data-gen | read-only: real audio-hours on disk across short/extended/long |
+| `scripts/18_render_all.sh` | data-gen | render the full consolidated corpus unattended, resumable |
+| `scripts/13_upload_hf.py` | publish | uploads corpus to HF, Dataset-Viewer parquet, resumable |
+
+## Config files
+
+| File | Governs |
+|---|---|
+| `configs/data_gen.yaml` | LLM model/pricing, batch size, concurrency, Soniox, Mimi, budget target |
+| `configs/data_gen_extended.yaml` | same, but `utterance_length: extended` — additive ~3-8 s user turns (generation only) |
+| `configs/data_gen_long.yaml` | same, but `utterance_length: long` — additive ~12-25 s turns (generation only) |
+| `configs/data_gen_extended_long.yaml` | legacy — extended+long are merged straight into `data_gen.yaml`'s corpus now |
+| `configs/phase1_corpus.yaml` | Phase-1 sources per language, weights, target hours, gender balance |
+| `configs/train_phase1.yaml` | Phase-1 hyperparameters (LoRA, LR 2e-4, 1-2 epochs) |
+| `configs/train_phase2.yaml` | Phase-2 hyperparameters (full FT, LR 1e-4, focal loss weights) |
+| `.env` | secrets only — `OPENAI_API_KEY`, `SONIOX_API_KEY`, `HF_TOKEN` |
+
+## Directory map
+
+```
+thinkspark/            the package — one module per pipeline stage
+scripts/                00-12 + P1_01/P1_02 CLI stages + make_samples.py + run_all.sh
+configs/                data_gen.yaml · phase1_corpus.yaml · train_phase1.yaml · train_phase2.yaml
+data/samples/            committed, offline sample scenarios + frames
+data/voice_refs/         drop your own reference clips here; voice_profiles.json (cloned IDs) lands here too
+data/plan/               auto-built balanced job plan (git-ignored)
+data/phase1_raw/         fetched free-audio wavs + manifest.jsonl (git-ignored)
+data/{scenarios,audio,encoded,frames,frames_phase1}/   generated artifacts (git-ignored)
+data/thinkspark_runs.db  SQLite audit/cost log — runs, llm_calls, tts_calls, unit_evals,
+                          scenario_registry (which scenarios were actually generated; git-ignored)
+reports/                 cost_report.csv, generation_report.html, eval.json, data_quality.txt
+artifacts/               checkpoints (git-ignored)
+docs/                    you are here — Mintlify docs
+```

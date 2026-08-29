@@ -1,0 +1,107 @@
+---
+title: "Setup"
+description: "conda env, dependencies, secrets — do this once"
+icon: "wrench"
+---
+
+<Warning>
+Nothing in this project runs on its own. Every command below is meant to be copy-pasted
+and run **by hand**, one stage at a time, so you can check the output before spending
+budget on the next stage.
+</Warning>
+
+## 1. Activate the environment
+
+```bash
+conda activate llms
+```
+
+<Note>
+All commands in these docs assume you're inside the `kupe-thinkspark-v2-350m/` project
+folder and this conda env is active.
+</Note>
+
+## 2. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+<Accordion title="What's actually in requirements.txt">
+- **Core/training**: `torch`, `transformers` (Gemma-3-270M + Mimi), `accelerate`, `peft` (LoRA)
+- **Phase-0 encode**: `torchaudio` (f0 extraction), `soundfile`
+- **Data generation**: `openai` (scenario writer + judge), `websocket-client` (Soniox)
+- **Monitoring**: `rich` (live dashboard — optional, falls back to plain text)
+- **Hugging Face**: `huggingface_hub` (Gemma weights)
+</Accordion>
+
+## 3. Set your secrets
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env`:
+
+```bash .env
+# LLM for scenario generation + judging (any OpenAI-compatible endpoint)
+OPENAI_API_KEY=sk-...
+# OPENAI_BASE_URL=https://api.openai.com/v1   # point at DeepSeek/Gemma-3 host if not OpenAI
+
+# Soniox TTS — renders USER audio only
+SONIOX_API_KEY=your_soniox_api_key_here
+
+# Hugging Face — pulls gated Gemma-3-270M weights
+HF_TOKEN=hf_...
+```
+
+<Tip>
+`.env` is git-ignored. Never put secrets in `configs/*.yaml` — those files are meant to be
+committed and shared.
+</Tip>
+
+## 4. Pick your generation model
+
+Open `configs/data_gen.yaml` and set:
+
+```yaml configs/data_gen.yaml
+llm_model: "deepseek-v3-flash"      # or "gemma-3-27b-it", or any OpenAI-compatible model
+llm_base_url: "https://your-provider-endpoint/v1"
+```
+
+Also fill in pricing so the [cost monitor](/commands/monitoring-cost) reports real numbers:
+
+```yaml configs/data_gen.yaml
+llm_price_in_per_1m_usd: 0.20     # check your provider's pricing page
+llm_price_out_per_1m_usd: 0.80
+```
+
+## 5. Sanity-check everything works, offline
+
+This needs **no API keys and no GPU** — it only exercises the pure-Python schema/frame
+logic against hand-authored samples:
+
+```bash
+python scripts/make_samples.py
+```
+
+```
+  sample_endpoint_en              endpoint_end         ok
+  sample_backchannel_en           backchannel          ok
+  sample_backchannel_silent_hi    backchannel          ok
+  sample_barge_real_hi            barge_real           ok
+  sample_barge_lookalike_hi       barge_lookalike       ok
+  sample_incomplete_gu            incomplete_thinking   ok
+  sample_silence_break_en         silence_break         ok
+  sample_correction_hi            correction            ok
+
+wrote 8 scenarios (8 valid) -> data/samples/scenarios_sample.jsonl
+wrote 8 frame records -> data/samples/frames_sample.jsonl
+```
+
+If every line says `ok`, you're set up correctly. Read [`data/samples/README.md`](/literature/data-theory)
+to see exactly what these files contain before moving on.
+
+<Card title="Next: Data generation" icon="database" href="/commands/data-generation">
+  Plan the balanced corpus, then generate it with the LLM.
+</Card>

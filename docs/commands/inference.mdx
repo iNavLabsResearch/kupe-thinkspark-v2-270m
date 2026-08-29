@@ -1,0 +1,95 @@
+---
+title: "Inference"
+description: "Drive the live referee over a real frame stream"
+icon: "satellite-dish"
+---
+
+## Run the demo
+
+```bash
+python scripts/09_infer_demo.py --config configs/train_phase2.yaml \
+    --ckpt artifacts/thinkspark-v2-350m/phase2/final \
+    --encoded data/encoded/<scenario_id>.npz \
+    --agent-text "aapka EMI due hai teerah hazaar"
+```
+
+Pick any `.npz` under `data/encoded/` from a scenario you rendered — e.g. one of the
+`barge_real` scenarios makes a good first test since the decision is unambiguous.
+
+## What it prints
+
+```
+      >> stop_tts + send agent-so-far to LLM
+
+--- decision log ---
+  TTS_SPEAKING -> HOLD          
+  TTS_SPEAKING -> HOLD          
+  TTS_SPEAKING -> BARGE_HARD    
+  TTS_DONE     -> LISTEN        
+  ...
+
+referee decode p50/p95 = 6.1 / 14.8 ms (target p95 <= 80 ms frame budget)
+```
+
+Each line is `agent-state -> control flag (-> spoken text if any)`, exactly what the
+orchestrator would see frame-by-frame in production.
+
+## Wiring it into your own SDK / LiveKit / Pipecat
+
+`thinkspark.inference.StreamingReferee` + `ReferenceOrchestrator` are the two classes to
+reuse. The orchestrator takes callbacks — wire these to your real TTS/LLM calls instead of
+the demo's print statements:
+
+```python
+from thinkspark.inference import StreamingReferee, ReferenceOrchestrator, FrameInput
+
+referee = StreamingReferee(model, tokenizer, system_prompt=SYSTEM_PROMPT, device="cuda")
+referee.set_context(agent_text=current_agent_text, stt_partial=latest_stt_partial)
+
+orch = ReferenceOrchestrator(
+    referee,
+    on_barge_hard=my_stop_tts_and_reprompt_llm,
+    on_barge_soft=my_duck_tts,
+    on_prefetch=my_start_speculative_llm,
+    on_commit=my_play_prefetched_reply,
+    on_cancel=my_abort_llm,
+    on_turn_end=my_commit_llm_to_tts,
+    tts_stream=my_tts_stream,
+)
+
+# in your real-time audio loop, once per 80ms frame:
+result = orch.handle(FrameInput(cb0=tok, energy=e, f0=f0, agent_state=current_state))
+```
+
+<Tip>
+`agent_state` is a **plain string you control** (`IDLE` / `LLM_GEN` / `TTS_SPEAKING` /
+`TTS_DONE`) — your orchestrator already knows this from its own state machine. No TTS
+timestamps needed, which is exactly what keeps this vendor-agnostic.
+</Tip>
+
+## The frame budget
+
+The referee has an **80 ms** window per frame (12.5 Hz). Decode latency (from the
+evaluation report) needs p95 comfortably under that — single-digit ms on GPU, ≤ 25 ms on
+CPU is typical for this model size. If you're seeing higher:
+
+<AccordionGroup>
+  <Accordion title="Check you're not re-running the full sequence every frame">
+    `StreamingReferee` re-runs over a small trailing window (`window_frames`, default 96)
+    for clarity. For production, swap in a real KV-cache stream — the model already runs
+    KV-cache-friendly (see `model.forward` and its `use_cache` path).
+  </Accordion>
+  <Accordion title="Confirm bf16 + the right device">
+    `device="cuda"` with bf16 weights; CPU inference is fine for testing but will be
+    slower — budget accordingly if that's your production target.
+  </Accordion>
+  <Accordion title="Keep spoken_max_new small">
+    Back-channels are 1–3 words. `StreamingReferee.spoken_max_new` (default 12) caps
+    greedy-decode length for the spoken head — don't raise it much, it directly adds to
+    per-frame latency whenever a back-channel fires.
+  </Accordion>
+</AccordionGroup>
+
+<Card title="Back to Commands: Monitoring & cost" icon="gauge" href="/commands/monitoring-cost">
+  Revisit the live dashboard used during data generation.
+</Card>

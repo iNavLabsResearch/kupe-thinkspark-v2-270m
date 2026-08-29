@@ -1,0 +1,35 @@
+# Phase 1 — modality alignment (Section 9). Mimi tokens -> text (ASR-style) + VAP aux.
+# ~400-450 h free open audio, LoRA / partial unfreeze. Fits Kaggle 2xT4.
+
+phase: 1
+base_model: "google/gemma-3-270m"   # HF token required (HF_TOKEN in .env)
+hf_token_env: "HF_TOKEN"
+
+frames_dir: "data/frames_phase1"
+encoded_dir: "data/encoded"
+seq_len: 1024
+
+optimizer: "adamw"
+weight_decay: 0.1
+lr: 2.0e-4                 # Phase-1 LR (Section 9.4)
+warmup_ratio: 0.03
+batch_size: 16
+grad_accum: 4             # effective batch 32-64
+epochs: 2                 # P1: 1-2 epochs
+precision: "bf16"
+grad_checkpointing: true
+frame_drop_aug: 0.05
+
+use_lora: true            # Phase 1 uses LoRA / partial unfreeze
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+lambda_vap: 0.3           # L_P1 = L_align + 0.3 * L_vap
+vap_horizon: 25           # ~2 s of future 80 ms bins
+
+out_dir: "artifacts/thinkspark-v2-350m/phase1"
+log_every: 20
+save_every: 500
+seed: 1234
+ddp: false                # set true and launch with torchrun --nproc_per_node=2

@@ -1,0 +1,59 @@
+# ThinkSpark-v2-350M — MERGED extended + long rendering config.
+#
+# The extended (~3-8 s) and long (~12-25 s) scenario corpora were generated separately
+# (configs/data_gen_extended.yaml / data_gen_long.yaml) but their Soniox/pricing/voice
+# settings were always identical — only `utterance_length` and the plan sizing differed,
+# and that only mattered for GENERATION (scripts/02), not rendering. Their scenarios_all
+# .jsonl files have been merged into data/scenarios_extended_long/scenarios_all.jsonl
+# (verified: 0 scenario_id collisions between them, every merged scenario re-validates
+# clean) so they render as ONE corpus from here on, in one dashboard/run/DB.
+#
+# The already-rendered extended clips (data/audio_extended/) were moved into
+# data/audio_extended_long/ — they are NOT re-rendered, resumability picks up exactly
+# where both corpora left off.
+#
+#   python scripts/03_render_user_audio.py --config configs/data_gen_extended_long.yaml \
+#       --in data/scenarios_extended_long/scenarios_all.jsonl --audio-dir data/audio_extended_long
+
+# Informational only at render time (drives the dashboard's "hours target", not scenario
+# count — the scenarios already exist). 15h (extended) + 33h (long) = 48h combined.
+total_hours: 48.0
+avg_window_seconds: 5.5          # unused for rendering pre-generated scenarios
+utterance_length: extended        # unused for rendering; scenarios already carry their own text
+
+# ---- LLM (unused for rendering; kept for schema completeness / any re-gen later) ----
+llm_model: "gemma-4-31b-it"
+llm_base_url: "https://cloud.olakrutrim.com/v1"
+llm_temperature: 0.9
+llm_max_tokens: 1600
+llm_max_retries: 5
+llm_concurrency: 30
+batch_size: 12
+
+judge_model: "gemma-4-31b-it"
+
+# ---- Soniox TTS (identical to data_gen_extended.yaml / data_gen_long.yaml) ----------
+soniox_ws_url: "wss://tts-rt.soniox.com/tts-websocket"
+soniox_model: "tts-rt-v2"
+soniox_sample_rate: 24000
+soniox_max_retries: 5
+soniox_concurrency: 3
+
+mimi_repo: "kyutai/mimi"
+mimi_sample_rate: 24000
+
+num_parts: 8
+seed: 1234
+
+behaviour_shares: {}
+language_shares: {}
+domain_shares: {}
+
+# ---- cost tracking (same rates; own DB — historical extended/long DBs untouched) ----
+llm_price_in_per_1m_usd: 0.108
+llm_price_out_per_1m_usd: 0.398
+soniox_price_per_hour_usd: 0.70
+inr_per_usd: 83.0
+budget_inr_target: 5000.0
+
+db_path: "data/thinkspark_runs_extended_long.db"

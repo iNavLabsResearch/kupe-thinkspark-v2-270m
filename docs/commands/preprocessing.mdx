@@ -1,0 +1,106 @@
+---
+title: "Preprocessing"
+description: "Fetch the Phase-1 corpus, Mimi-encode everything, build frame records"
+icon: "waveform-lines"
+---
+
+<Steps>
+
+<Step title="Get the Phase-1 free corpus (once)">
+```bash
+pip install datasets soundfile
+export HF_TOKEN=hf_...
+
+python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml --dry-run
+python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml
+```
+See [Phase-1 corpus](/commands/phase1-corpus) for the full source list, per-language
+targets, and why each one is in the mix. Streams (never fully downloads) real, verified
+HuggingFace sources — stops per-source the moment its share of the target hours is
+reached, so disk/bandwidth stay bounded on Kaggle. Resumable via
+`data/phase1_raw/manifest.jsonl`.
+
+<Note>
+Not a Phase-2 (referee) prerequisite — you can train Phase-2 without ever running this,
+just skip `--init` on `07_train_phase2.py`. It's what Phase-1 (modality alignment) needs.
+</Note>
+</Step>
+
+<Step title="Phase 0 — encode audio to Mimi cb0 + energy + f0">
+
+For the **Phase-2 synthetic corpus** (Soniox user audio you rendered earlier):
+```bash
+python scripts/00_encode_audio.py --config configs/data_gen.yaml \
+    --audio-dir data/audio --out-dir data/encoded
+```
+
+For the **Phase-1 free corpus** you just fetched, once per language:
+```bash
+python scripts/00_encode_audio.py --config configs/data_gen.yaml \
+    --wav-dir data/phase1_raw/hi --out-dir data/encoded
+```
+
+Writes one `<name>.npz` per wav (`cb0` int64, `energy` float32, `f0` float32 at 12.5 Hz).
+Resumable — already-encoded files are skipped.
+
+```bash
+export HF_TOKEN=hf_...     # Mimi is public but a token avoids rate limits
+```
+</Step>
+
+<Step title="Build per-frame training records">
+
+Phase 2 — calibrates the LLM's *relative* `frame_offset` hints to real Soniox
+timestamps and attaches the Mimi shard:
+```bash
+python scripts/04_build_frames.py --in data/scenarios/scenarios_all.jsonl \
+    --frames-out data/frames/frames_all.jsonl
+```
+
+Phase 1 — pairs each fetched clip's Mimi shard with its transcript (the ASR-style
+alignment target for `thinkspark.losses.Phase1Loss`), once per language:
+```bash
+python scripts/P1_02_build_frames.py --lang hi
+```
+
+Both produce records `thinkspark.dataset.ThinkSparkDataset` consumes — one JSON line
+per clip/scenario with `flags`, `agent_state`, `speaking_mask` arrays, one entry per
+80 ms frame. Phase-1 records set `flags`/`agent_state` to inert defaults (`LISTEN`/
+`IDLE`) since `Phase1Loss` never reads them — only `align_labels` (from `user_text`)
+and `vap` (from `speaking_mask`) matter for Phase 1.
+</Step>
+
+</Steps>
+
+## Read the format before training
+
+```bash
+cat data/samples/frames_sample.jsonl | python -m json.tool | head -30
+```
+
+Or just open [`data/samples/README.md`](/literature/data-theory) — it walks through every
+field with a worked example (`sample_endpoint_en`): `LISTEN` across the turn, then
+`PREFETCH_LLM` fires *before* `TURN_END`, then `COMMIT_LLM` — visible directly in the
+`flags` array.
+
+## Full copy-paste block
+
+```bash
+conda activate llms
+export HF_TOKEN=hf_...
+
+# Phase 1 (once): fetch, encode, build frames
+python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml
+for lang in en hi gu; do
+  python scripts/00_encode_audio.py --config configs/data_gen.yaml --wav-dir "data/phase1_raw/$lang" --out-dir data/encoded
+  python scripts/P1_02_build_frames.py --lang "$lang"
+done
+
+# Phase 2 (per generation run)
+python scripts/00_encode_audio.py --config configs/data_gen.yaml --audio-dir data/audio --out-dir data/encoded
+python scripts/04_build_frames.py --in data/scenarios/scenarios_all.jsonl --frames-out data/frames/frames_all.jsonl
+```
+
+<Card title="Next: Training" icon="brain" href="/commands/training">
+  Phase 1 (alignment) then Phase 2 (referee fine-tune).
+</Card>
