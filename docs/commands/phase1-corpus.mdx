@@ -111,13 +111,18 @@ python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
 python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
     --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data
 ```
-Every stage logs its own timestamped, tagged lines (`[DOWNLOAD]`, `[ENCODE]`,
-`[FRAMES]`, `[UPLOAD]`, plus a periodic `[STATUS]` summary across all of them) — safe to
-watch while several stages run at once. Fully resumable: Ctrl+C any time, re-run the
-same command, every stage (download via the manifest, encode via existing `.npz`,
-upload via a `hf_sync` SQLite table) picks up exactly where it left off. `--no-upload`
-runs it purely locally. Run `--no-upload` first if you just want the corpus without
-publishing it anywhere.
+Every stage logs its own timestamped, tagged, color-coded lines (`[DOWNLOAD]` cyan,
+`[ENCODE]` yellow, `[FRAMES]` blue, `[UPLOAD]` green, errors bold red — via `rich`, an
+existing optional dependency; falls back to identical plain text if `rich` isn't
+installed) — safe to watch while several stages run at once. Below the scrolling log, a
+pinned live table (redraws every 2s) shows, per language: a tqdm-style download-progress
+bar (hours so far / target), how many clips encoded, how many uploaded (to the exact
+`--hf-repo` named in the title), and how many raw wavs deleted (disk freed) — plus a
+TOTAL row and queue depths. Fully resumable: Ctrl+C any time, re-run the same command,
+every stage (download via the manifest, encode via existing `.npz`, upload via a
+`hf_sync` SQLite table) picks up exactly where it left off. `--no-upload` runs it purely
+locally. Run `--no-upload` first if you just want the corpus without publishing it
+anywhere.
 
 Local-only, no upload: `python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml --no-upload`
 

@@ -85,11 +85,35 @@ from thinkspark.phase1_corpus import (
 _ = _hf_log  # imported for parity/reference; this script uses its own tagged Logger below
 
 STATUS_INTERVAL_S = 30.0
+DASHBOARD_REFRESH_S = 2.0   # how often the rich Live table redraws (independent of STATUS_INTERVAL_S)
+
+# `rich` is an existing optional dependency in this project (see requirements.txt,
+# already used by scripts/11_monitor.py with the same plain-text-fallback pattern) — no
+# new dependency introduced here, just reused for a colorful/tqdm-style dashboard instead
+# of flat log lines. Every rich object below funnels through ONE shared Console so the
+# Live table and the tagged log lines interleave correctly instead of corrupting each
+# other's redraws (both write to the same stdout).
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.live import Live
+    _RICH = True
+    _console = Console()
+except ImportError:
+    _RICH = False
+    _console = None
+
+_STAGE_STYLE = {
+    "DOWNLOAD": "cyan", "ENCODE": "yellow", "FRAMES": "blue",
+    "UPLOAD": "green", "STATUS": "magenta", "MAIN": "white", "CLEANUP": "red",
+}
 
 
 # --------------------------------------------------------------------------- #
 class Logger:
-    """Thread-safe, tagged, timestamped logging — many workers print concurrently."""
+    """Thread-safe, tagged, timestamped logging — many workers print concurrently.
+    Colorized via `rich` when available (one color per stage, errors in bold red),
+    identical plain-text output otherwise — same fallback pattern as scripts/11_monitor.py."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -97,7 +121,15 @@ class Logger:
     def __call__(self, stage: str, tag: str, msg: str) -> None:
         with self._lock:
             ts = time.strftime("%H:%M:%S")
-            print(f"[{ts}] [{stage:<8}] {tag:<22} {msg}", flush=True)
+            if _RICH:
+                is_err = msg.lstrip().startswith("!")
+                style = "bold red" if is_err else _STAGE_STYLE.get(stage, "white")
+                _console.print(
+                    f"[dim]\\[{ts}][/dim] [{style}]\\[{stage:<8}][/{style}] "
+                    f"[bold]{tag:<22}[/bold] {msg}"
+                )
+            else:
+                print(f"[{ts}] [{stage:<8}] {tag:<22} {msg}", flush=True)
 
 
 class LockedWriter:
@@ -132,6 +164,12 @@ class PipelineStatus:
         self.lang_uploaded_frames: set[str] = set()
         self.npz_encoded_total = 0
         self.npz_uploaded_total = 0
+        self.deleted_wavs_total = 0
+        # Per-language breakdown — what the colorful dashboard actually renders per row
+        # ("how many encoded", "how many uploaded [of which db/repo]", "what deleted").
+        self.lang_npz_encoded: dict[str, int] = {lang: 0 for lang in langs}
+        self.lang_npz_uploaded: dict[str, int] = {lang: 0 for lang in langs}
+        self.lang_deleted: dict[str, int] = {lang: 0 for lang in langs}
         self.upload_queue_depth = 0
         self.encode_queue_depth = 0
         self.done = False
@@ -139,6 +177,21 @@ class PipelineStatus:
     def add_download_hours(self, lang: str, hours: float) -> None:
         with self._lock:
             self.download_hours[lang] = self.download_hours.get(lang, 0.0) + hours
+
+    def add_encoded(self, lang: str, n: int = 1) -> None:
+        with self._lock:
+            self.npz_encoded_total += n
+            self.lang_npz_encoded[lang] = self.lang_npz_encoded.get(lang, 0) + n
+
+    def add_uploaded(self, lang: str, n: int) -> None:
+        with self._lock:
+            self.npz_uploaded_total += n
+            self.lang_npz_uploaded[lang] = self.lang_npz_uploaded.get(lang, 0) + n
+
+    def add_deleted(self, lang: str, n: int = 1) -> None:
+        with self._lock:
+            self.deleted_wavs_total += n
+            self.lang_deleted[lang] = self.lang_deleted.get(lang, 0) + n
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -150,23 +203,89 @@ class PipelineStatus:
                 "lang_uploaded_frames": set(self.lang_uploaded_frames),
                 "npz_encoded_total": self.npz_encoded_total,
                 "npz_uploaded_total": self.npz_uploaded_total,
+                "deleted_wavs_total": self.deleted_wavs_total,
+                "lang_npz_encoded": dict(self.lang_npz_encoded),
+                "lang_npz_uploaded": dict(self.lang_npz_uploaded),
+                "lang_deleted": dict(self.lang_deleted),
                 "encode_queue_depth": self.encode_queue_depth,
                 "upload_queue_depth": self.upload_queue_depth,
             }
 
 
-def status_summary_loop(status: PipelineStatus, log: Logger, stop_event: threading.Event) -> None:
-    while not stop_event.wait(STATUS_INTERVAL_S):
-        s = status.snapshot()
-        dl_bits = ", ".join(
-            f"{lang}={s['download_hours'].get(lang, 0.0):.1f}/{s['download_targets'].get(lang, 0.0):.0f}h"
-            for lang in status.langs
+def _bar(frac: float, width: int = 20) -> str:
+    """tqdm-style block bar, e.g. '████████░░░░░░░░ 41%' — used inside the rich table."""
+    frac = max(0.0, min(1.0, frac))
+    filled = int(round(frac * width))
+    return f"{'█' * filled}{'░' * (width - filled)} {frac * 100:4.0f}%"
+
+
+def _render_dashboard(status: PipelineStatus, hf_repo: str | None) -> "Table":
+    from rich.table import Table
+
+    s = status.snapshot()
+    table = Table(title=f"ThinkSpark-v2-350M — Phase-1 pipeline"
+                        f"{'  ->  ' + hf_repo if hf_repo else '  (local only, no upload)'}",
+                 title_style="bold white", header_style="bold white", expand=True)
+    table.add_column("Lang", style="bold")
+    table.add_column("Downloaded", ratio=3)
+    table.add_column("Encoded", justify="right", style="yellow")
+    table.add_column("Uploaded", justify="right", style="green")
+    table.add_column("Deleted (freed)", justify="right", style="red")
+
+    for lang in status.langs:
+        have = s["download_hours"].get(lang, 0.0)
+        target = s["download_targets"].get(lang, 0.0) or 1.0
+        bar = _bar(have / target)
+        dl_style = "cyan" if lang not in s["lang_downloaded"] else "bold cyan"
+        table.add_row(
+            lang,
+            f"[{dl_style}]{bar}[/{dl_style}] {have:.1f}/{target:.0f}h",
+            str(s["lang_npz_encoded"].get(lang, 0)),
+            str(s["lang_npz_uploaded"].get(lang, 0)),
+            str(s["lang_deleted"].get(lang, 0)),
         )
-        log("STATUS", "overall", f"download[{dl_bits}]  "
-           f"encoded_langs={sorted(s['lang_encoded'])}  "
-           f"uploaded_langs={sorted(s['lang_uploaded_frames'])}  "
-           f"npz_encoded={s['npz_encoded_total']}  npz_uploaded={s['npz_uploaded_total']}  "
-           f"queues[encode={s['encode_queue_depth']} upload={s['upload_queue_depth']}]")
+
+    table.add_section()
+    table.add_row(
+        "[bold]TOTAL[/bold]", "",
+        f"[bold yellow]{s['npz_encoded_total']}[/bold yellow]",
+        f"[bold green]{s['npz_uploaded_total']}[/bold green]",
+        f"[bold red]{s['deleted_wavs_total']}[/bold red]",
+    )
+    table.caption = (f"queues: encode={s['encode_queue_depth']} upload={s['upload_queue_depth']}   "
+                    f"encoded_langs={sorted(s['lang_encoded']) or '-'}   "
+                    f"uploaded_langs={sorted(s['lang_uploaded_frames']) or '-'}")
+    return table
+
+
+def status_summary_loop(status: PipelineStatus, log: Logger, stop_event: threading.Event,
+                        hf_repo: str | None = None) -> None:
+    if not _RICH:
+        # Plain-text fallback — identical to the pre-dashboard behavior, so a machine
+        # without `rich` installed still gets a full status line, just not colorful.
+        while not stop_event.wait(STATUS_INTERVAL_S):
+            s = status.snapshot()
+            dl_bits = ", ".join(
+                f"{lang}={s['download_hours'].get(lang, 0.0):.1f}/{s['download_targets'].get(lang, 0.0):.0f}h"
+                for lang in status.langs
+            )
+            log("STATUS", "overall", f"download[{dl_bits}]  "
+               f"encoded_langs={sorted(s['lang_encoded'])}  "
+               f"uploaded_langs={sorted(s['lang_uploaded_frames'])}  "
+               f"npz_encoded={s['npz_encoded_total']}  npz_uploaded={s['npz_uploaded_total']}  "
+               f"deleted={s['deleted_wavs_total']}  "
+               f"queues[encode={s['encode_queue_depth']} upload={s['upload_queue_depth']}]")
+        return
+
+    # Rich path: a small Live table pinned at the bottom of the terminal, redrawn every
+    # DASHBOARD_REFRESH_S. Tagged log lines (Logger, above) keep printing normally through
+    # the SAME Console — Live is explicitly designed to support interleaved console.print
+    # calls from other threads while it's active, so the scrolling event log and the
+    # pinned live summary coexist without corrupting each other's redraws.
+    with Live(_render_dashboard(status, hf_repo), console=_console,
+             refresh_per_second=1.0 / DASHBOARD_REFRESH_S, transient=False) as live:
+        while not stop_event.wait(DASHBOARD_REFRESH_S):
+            live.update(_render_dashboard(status, hf_repo))
 
 
 def periodic_encode_sweep(encode_q: "queue.Queue[str | None]", langs: list[str],
@@ -253,7 +372,7 @@ def encode_and_build_frames(lang: str, cfg, args, log, status) -> int:
             enc = _encoder.encode_wav_file(str(wav))
             enc.save(out_path)
             new_count += 1
-            status.npz_encoded_total += 1
+            status.add_encoded(lang)
             if new_count % 25 == 0:
                 log("ENCODE", lang, f"...{new_count} new clips encoded so far")
             # Raw wav is only needed to PRODUCE the .npz — once that's saved (and
@@ -268,6 +387,7 @@ def encode_and_build_frames(lang: str, cfg, args, log, status) -> int:
                     if len(np.load(out_path)["cb0"]) > 0:
                         wav.unlink()
                         deleted_count += 1
+                        status.add_deleted(lang)
                     else:
                         log("ENCODE", lang, f"! {wav.name} encoded to 0 frames — keeping wav for inspection")
                 except Exception as ve:
@@ -461,7 +581,7 @@ def _upload_language(api, args, db: RunDB, lang: str, log, status, CommitOperati
         )
         for cid in ids:
             db.mark_hf_synced(cid, args.hf_repo)
-        status.npz_uploaded_total += len(ops)
+        status.add_uploaded(lang, len(ops))
 
     # frames file itself — small, always re-upload the current version (it's rebuilt
     # fully on every encode pass for this language, so a stale remote copy is just wrong)
@@ -726,7 +846,8 @@ def main():
 
     db = RunDB(ROOT / args.db)
 
-    status_thread = threading.Thread(target=status_summary_loop, args=(status, log, stop_event), daemon=True)
+    status_thread = threading.Thread(
+        target=status_summary_loop, args=(status, log, stop_event, args.hf_repo), daemon=True)
     status_thread.start()
 
     encode_thread = threading.Thread(
