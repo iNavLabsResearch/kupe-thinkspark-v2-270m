@@ -77,7 +77,7 @@ ROOT = setup()
 
 from thinkspark.config import env
 from thinkspark.db import RunDB
-from thinkspark.hf_upload import create_commit_with_backoff, ensure_repo, log as _hf_log
+from thinkspark.hf_upload import create_commit_with_backoff, ensure_repo, npz_repo_path, log as _hf_log
 from thinkspark.phase1_corpus import (
     Phase1CorpusConfig, build_frame_record, existing_written, fetch_source, manifest_path,
 )
@@ -668,7 +668,7 @@ def _upload_language(api, args, db: RunDB, lang: str, log, status, CommitOperati
     commits = []
     cur, cur_ids = [], []
     for cid, path in to_upload:
-        cur.append(CommitOperationAdd(path_in_repo=f"encoded/{lang}/{path.name}", path_or_fileobj=str(path)))
+        cur.append(CommitOperationAdd(path_in_repo=npz_repo_path(lang, path.name), path_or_fileobj=str(path)))
         cur_ids.append(cid)
         if len(cur) >= args.files_per_commit:
             commits.append((cur, cur_ids))

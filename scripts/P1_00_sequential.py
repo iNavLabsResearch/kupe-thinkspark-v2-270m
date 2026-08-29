@@ -72,7 +72,7 @@ ROOT = setup()
 
 from thinkspark.config import env
 from thinkspark.db import RunDB
-from thinkspark.hf_upload import create_commit_with_backoff, ensure_repo
+from thinkspark.hf_upload import create_commit_with_backoff, ensure_repo, npz_repo_path
 from thinkspark.phase1_corpus import (
     Phase1CorpusConfig, build_frame_record, existing_written, fetch_source, manifest_path,
 )
@@ -336,7 +336,7 @@ def stage_upload(lang: str, args, db: RunDB) -> None:
             cur, cur_ids = [], []
             commits = []
             for cid, path in to_upload:
-                cur.append(CommitOperationAdd(path_in_repo=f"encoded/{lang}/{path.name}",
+                cur.append(CommitOperationAdd(path_in_repo=npz_repo_path(lang, path.name),
                                               path_or_fileobj=str(path)))
                 cur_ids.append(cid)
                 if len(cur) >= args.files_per_commit:

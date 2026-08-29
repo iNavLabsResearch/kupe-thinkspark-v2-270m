@@ -37,6 +37,31 @@ def sleep_with_jitter(seconds: float) -> None:
     time.sleep(max(0.5, seconds + jitter))
 
 
+def npz_repo_path(lang: str, filename: str) -> str:
+    """Where to upload an encoded `.npz` under, bucketed into subdirectories to stay
+    under HF/git's real, hard limit of ~10,000 files per directory. Real observed
+    failure this fixes: a single language's flat `encoded/<lang>/` directory hit that
+    cap mid-upload (25,704 clips for `en` alone) and HF rejected every further commit
+    with "too many files per directory", even though the commit itself was fine — the
+    directory as a whole was just too big.
+
+    Buckets by the clip_id's own hash (the last 16 hex chars of the filename stem,
+    before the extension — see `thinkspark.phase1_corpus.clip_id`, which produces
+    exactly that) into up to 256 near-evenly-distributed subdirectories, so even a
+    multi-hundred-thousand-clip language stays well under the per-directory limit.
+    Filenames are `<source_id>_<clip_id>.npz` — slicing the LAST 16 chars of the stem
+    (not splitting on "_") is deliberate: some source ids (kathbath, shrutilipi,
+    indictts) don't contain underscores but this is robust even if one ever did.
+
+    Existing files already uploaded flatly (before this fix existed) are left exactly
+    where they are — nothing here touches or migrates them. `scripts/19_fetch_training_data.py`
+    globs recursively (`encoded/<lang>/**/*.npz`) so it picks up both the old flat files
+    and new bucketed ones from the same repo without needing any cleanup step."""
+    stem = filename.rsplit(".", 1)[0]
+    cid = stem[-16:]
+    return f"encoded/{lang}/{cid[:2]}/{filename}"
+
+
 def create_commit_with_backoff(api, *, repo: str, operations: list, commit_message: str,
                                max_retries: int = 10, base_backoff: float = 20.0,
                                max_backoff: float = 300.0, log_fn=log) -> None:
