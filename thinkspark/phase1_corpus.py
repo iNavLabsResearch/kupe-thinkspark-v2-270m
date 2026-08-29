@@ -304,27 +304,47 @@ def _load_dataset_with_timeout(*args, timeout: float = LOAD_DATASET_TIMEOUT_S, *
 
     from datasets import load_dataset
 
-    kwargs.setdefault("trust_remote_code", True)
-    result: dict = {}
+    def _attempt(call_kwargs: dict):
+        result: dict = {}
 
-    def _run():
-        try:
-            result["value"] = load_dataset(*args, **kwargs)
-        except Exception as e:
-            result["error"] = e
+        def _run():
+            try:
+                result["value"] = load_dataset(*args, **call_kwargs)
+            except Exception as e:
+                result["error"] = e
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        raise RuntimeError(
-            f"load_dataset() timed out after {timeout:.0f}s opening "
-            f"{args[0] if args else kwargs.get('path')} — likely a network stall or a "
-            f"blocked confirmation prompt; will retry with a fresh attempt (timeout)"
-        )
-    if "error" in result:
-        raise result["error"]
-    return result["value"]
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            raise RuntimeError(
+                f"load_dataset() timed out after {timeout:.0f}s opening "
+                f"{args[0] if args else call_kwargs.get('path')} — likely a network "
+                f"stall or a blocked confirmation prompt; will retry with a fresh "
+                f"attempt (timeout)"
+            )
+        if "error" in result:
+            raise result["error"]
+        return result["value"]
+
+    # Try WITH trust_remote_code=True first — needed on OLDER `datasets` versions for
+    # script-based datasets to avoid a hidden confirmation prompt that can hang forever
+    # (the original bug this whole function guards against). Real, observed opposite
+    # problem on a NEWER `datasets` version: it removed the kwarg entirely and raises
+    # immediately if it's passed AT ALL — "trust_remote_code is not supported anymore.
+    # Please check that the ... dataset ... isn't based on a loading script and remove
+    # `trust_remote_code`." Falling back to calling without it makes this work across
+    # both old and new `datasets` versions without sniffing the installed version.
+    call_kwargs = dict(kwargs)
+    call_kwargs.setdefault("trust_remote_code", True)
+    try:
+        return _attempt(call_kwargs)
+    except (TypeError, ValueError) as e:
+        if "trust_remote_code" in str(e) and "not supported" in str(e).lower():
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs.pop("trust_remote_code", None)
+            return _attempt(fallback_kwargs)
+        raise
 
 
 # --------------------------------------------------------------------------- #
