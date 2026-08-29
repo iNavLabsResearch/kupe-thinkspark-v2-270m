@@ -125,6 +125,71 @@ class MimiEncoder:
         wav, sr = _read_wav(wav_path)
         return self.encode_waveform(wav, sr)
 
+    # ------------------------------------------------------------------ #
+    def encode_batch(self, waveforms: list[np.ndarray], sample_rates: list[int]) -> list[EncodedAudio]:
+        """Encode many clips in ONE forward pass — the real fix for GPU encoding being
+        slow (real observed case: an L4 GPU doing ~2.6 clips/sec one-at-a-time — that's
+        launch/Python overhead dominating, the GPU is mostly idle between tiny single-
+        item forward passes; batching amortizes that overhead across many clips per pass
+        instead). Verified against `transformers`' real Mimi source (not guessed):
+        `MimiModel.encode(input_values, padding_mask=...)` accepts a batch dimension,
+        and `MimiModel.get_audio_codes_mask(padding_mask)` gives back, per batch item,
+        exactly how many of the OUTPUT frames are real vs padding — needed because clips
+        in a batch have different lengths, so shorter ones are padded to the batch's max
+        length and must be trimmed back down afterward or they'd corrupt the frame count
+        (silently — no error, just wrong-length cb0/energy/f0 for the shorter clips)."""
+        self._ensure_loaded()
+        torch = self._torch
+
+        processed = []
+        for wav, sr in zip(waveforms, sample_rates):
+            wav = _to_mono_float(wav)
+            if sr != _MIMI_RATE:
+                wav = _resample(wav, sr, _MIMI_RATE)
+            processed.append(wav)
+
+        inputs = self._fe(raw_audio=processed, sampling_rate=_MIMI_RATE, padding=True, return_tensors="pt")
+        input_values = inputs["input_values"].to(self._device)
+        padding_mask = inputs.get("padding_mask")
+        if padding_mask is not None:
+            padding_mask = padding_mask.to(self._device)
+
+        with torch.no_grad():
+            enc = self._model.encode(input_values, padding_mask=padding_mask)
+        codes = enc.audio_codes   # [B, num_codebooks, T_padded]
+
+        if padding_mask is not None:
+            # Defensive: this is the documented, correct way to recover valid lengths —
+            # but if it ever returns something unexpected (a version mismatch, e.g.),
+            # fail LOUDLY here rather than silently writing wrong-length training data.
+            codes_mask = self._model.get_audio_codes_mask(padding_mask)   # [B, T_padded] bool
+            valid_lens = codes_mask.sum(dim=-1).tolist()
+            assert len(valid_lens) == len(processed), (
+                f"get_audio_codes_mask returned {len(valid_lens)} lengths for "
+                f"{len(processed)} clips — batching bug, refusing to guess"
+            )
+        else:
+            # No padding_mask in the feature extractor's output at all (unexpected for
+            # a batch of different-length clips) — every item MUST then be the exact
+            # same length already (only possible if the caller passed same-length
+            # clips), otherwise this would silently mis-trim. Assert that instead of
+            # guessing.
+            lens = {len(w) for w in processed}
+            assert len(lens) == 1, (
+                "no padding_mask from feature extractor but clips have different "
+                "lengths — can't safely determine per-clip valid frame counts"
+            )
+            valid_lens = [codes.shape[-1]] * len(processed)
+
+        results = []
+        for i, wav in enumerate(processed):
+            n = int(valid_lens[i])
+            assert 0 < n <= codes.shape[-1], f"invalid trimmed length {n} (max {codes.shape[-1]})"
+            cb0 = codes[i, 0, :n].detach().cpu().numpy().astype(np.int64)
+            energy, f0 = _prosody(wav, _MIMI_RATE, num_frames=len(cb0))
+            results.append(EncodedAudio(cb0=cb0, energy=energy, f0=f0, num_frames=len(cb0)))
+        return results
+
 
 # --------------------------------------------------------------------------- #
 # prosody + io helpers (kept torch-free where possible)

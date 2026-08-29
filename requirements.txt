@@ -8,7 +8,13 @@
 
 # ---- core / training --------------------------------------------------------
 torch>=2.2                 # bf16 + CUDA on 2xT4 (MPS/CPU also work, slower)
-transformers>=4.44         # Gemma-3-270M (google/gemma-3-270m) + MimiModel (kyutai/mimi)
+transformers>=4.44,<5      # Gemma-3-270M (google/gemma-3-270m) + MimiModel (kyutai/mimi)
+# UPPER BOUND REQUIRED — real observed break: transformers 5.x raised its torch floor to
+# 2.5, and just silently DISABLES its own PyTorch backend (not an install error — an
+# ImportError only surfaced later, at model-load time: "PyTorch was not found") on any
+# box with torch<2.5, e.g. a RunPod image pinned to torch 2.4.1+cu124 to match its baked
+# CUDA build. Pinning transformers is far safer here than upgrading torch, which risks
+# breaking that CUDA-matched pre-baked build instead.
 accelerate>=0.33           # device placement / DDP helpers
 peft>=0.11                 # LoRA for Phase-1 (optional; only if use_lora=true)
 numpy>=1.26

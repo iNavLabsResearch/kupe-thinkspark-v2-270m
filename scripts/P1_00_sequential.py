@@ -157,30 +157,81 @@ def _get_encoder(device: str, cfg: Phase1CorpusConfig):
         return enc
 
 
+def _maybe_delete_wav(wav: Path, out_path: Path, args) -> None:
+    if args.keep_raw_audio:
+        return
+    import numpy as np
+    if len(np.load(out_path)["cb0"]) > 0:
+        wav.unlink()
+    else:
+        tqdm.write(f"  ! {wav.name} encoded to 0 frames — keeping wav for inspection")
+
+
 def _encode_shard(wavs: list[Path], device: str, encoded_dir: Path, cfg, args,
                   pbar: tqdm, pbar_lock: threading.Lock) -> int:
+    """Encodes `wavs` in batches of `args.encode_batch_size` — the real fix for slow GPU
+    throughput (real observed case: an L4 doing ~2.6 clips/sec one-at-a-time is almost
+    entirely Python/CUDA-launch overhead per call, not compute; batching amortizes that
+    across many clips per forward pass). Falls back to one-at-a-time ONLY for a batch
+    that raised (so one corrupt/unreadable clip can't waste an entire batch's otherwise-
+    good clips — they'd just get silently re-attempted next run instead of being lost)."""
+    import numpy as np
+    import soundfile as sf
+
     encoder = _get_encoder(device, cfg)
     new_count = 0
-    for wav in wavs:
-        out_path = encoded_dir / f"{wav.stem}.npz"
-        if out_path.exists():
-            with pbar_lock:
-                pbar.update(1)
+    batch_size = max(1, args.encode_batch_size)
+
+    i = 0
+    while i < len(wavs):
+        batch = wavs[i:i + batch_size]
+        i += batch_size
+
+        todo = []
+        for wav in batch:
+            out_path = encoded_dir / f"{wav.stem}.npz"
+            if out_path.exists():
+                with pbar_lock:
+                    pbar.update(1)
+            else:
+                todo.append(wav)
+        if not todo:
             continue
+
         try:
-            enc = encoder.encode_wav_file(str(wav))
-            enc.save(out_path)
-            new_count += 1
-            if not args.keep_raw_audio:
-                import numpy as np
-                if len(np.load(out_path)["cb0"]) > 0:
-                    wav.unlink()
-                else:
-                    tqdm.write(f"  ! {wav.name} encoded to 0 frames — keeping wav for inspection")
+            waveforms, sample_rates = [], []
+            for wav in todo:
+                arr, sr = sf.read(str(wav), dtype="float32", always_2d=False)
+                waveforms.append(np.asarray(arr, dtype=np.float32))
+                sample_rates.append(sr)
+            encoded_list = encoder.encode_batch(waveforms, sample_rates)
+            for wav, enc in zip(todo, encoded_list):
+                out_path = encoded_dir / f"{wav.stem}.npz"
+                enc.save(out_path)
+                new_count += 1
+                _maybe_delete_wav(wav, out_path, args)
+                with pbar_lock:
+                    pbar.update(1)
         except Exception as e:
-            tqdm.write(f"  ! failed {wav.name}: {e}")
-        with pbar_lock:
-            pbar.update(1)
+            tqdm.write(f"  ! batch of {len(todo)} failed ({e}) — retrying one at a time "
+                      f"so one bad clip doesn't cost the rest of the batch")
+            for wav in todo:
+                out_path = encoded_dir / f"{wav.stem}.npz"
+                try:
+                    enc = encoder.encode_wav_file(str(wav))
+                    enc.save(out_path)
+                    new_count += 1
+                    _maybe_delete_wav(wav, out_path, args)
+                except Exception as e2:
+                    tqdm.write(f"  ! failed {wav.name}: {e2}")
+                with pbar_lock:
+                    pbar.update(1)
+
+        # Once per BATCH now, not once per clip — batching already means far fewer GIL-
+        # holding forward-pass calls per second than the old one-clip-at-a-time loop, so
+        # this yield is needed far less often to still give any other thread a fair
+        # window (relevant only when len(devices) > 1, i.e. these shards run concurrently
+        # with each other — irrelevant, but harmless, for a single-device run).
         time.sleep(args.encode_yield_ms / 1000.0)
     return new_count
 
@@ -402,8 +453,24 @@ def main():
     ap.add_argument("--min-free-disk-gb", type=float, default=None,
                     help="pause downloads (stage 1) below this many GB free (default: "
                         "configs/phase1_corpus.yaml's min_free_disk_gb, 5.0 if unset)")
-    ap.add_argument("--encode-yield-ms", type=float, default=30.0,
-                    help="ms slept after every encoded clip to release the GIL (default 30)")
+    ap.add_argument("--encode-batch-size", type=int, default=16,
+                    help="clips encoded in ONE forward pass (default 16) — the main "
+                        "throughput lever on a GPU: one-at-a-time encoding leaves the "
+                        "GPU mostly idle behind per-call Python/CUDA-launch overhead "
+                        "(real observed case: an L4 doing ~2.6 clips/sec one-at-a-time). "
+                        "Raise it (e.g. 32-64) on a bigger GPU if VRAM allows; lower it "
+                        "(down to 1 for the old one-at-a-time behavior) if you hit an "
+                        "out-of-memory error. A batch that fails falls back to encoding "
+                        "its clips one at a time automatically, so a single bad clip "
+                        "never costs the rest of a batch.")
+    ap.add_argument("--encode-yield-ms", type=float, default=0.0,
+                    help="ms slept after every BATCH to release the GIL (default 0 — "
+                        "this script's download stage is a separate, already-finished "
+                        "phase by the time encoding starts, unlike P1_00_pipeline.py's "
+                        "concurrent architecture, so there's no download thread to "
+                        "protect from GIL starvation here; only matters if you pass "
+                        "multiple --devices, where shards run concurrently with each "
+                        "other)")
     ap.add_argument("--files-per-commit", type=int, default=200)
     ap.add_argument("--backoff", type=float, default=20.0)
     ap.add_argument("--max-backoff", type=float, default=300.0)

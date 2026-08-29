@@ -266,6 +266,21 @@ Output layout is exactly the training format — no extra step: `data/encoded/<l
 ready for `scripts/19_fetch_training_data.py` -> `scripts/06_train_phase1.py` with no
 re-encoding. Fully resumable at every stage — same manifest/`.npz`/`hf_sync` checks as
 the pipelined version. `--no-upload` skips stages 3-4 (download+encode only).
+
+<Tip>
+**GPU encoding throughput** — clips are batched (`--encode-batch-size`, default 16) into
+ONE forward pass instead of one-at-a-time. Real observed problem this fixes: an L4 GPU
+doing ~2.6 clips/sec one-at-a-time is almost entirely Python/CUDA-launch overhead per
+call, the GPU itself sits mostly idle between tiny single-item passes — batching
+amortizes that overhead across many clips per pass. Verified against `transformers`'
+real Mimi source (not guessed): `MimiModel.encode()` accepts a batch dimension, and
+`MimiModel.get_audio_codes_mask()` recovers each clip's real (unpadded) length
+afterward — tested offline with real variable-length audio. Raise `--encode-batch-size`
+(e.g. 32-64) on a bigger GPU if VRAM allows; lower it (down to 1 for the old behavior) if
+you hit an out-of-memory error. A batch that fails falls back to encoding its clips one
+at a time automatically, so one bad clip never costs the rest of a batch — verified
+offline.
+</Tip>
 </Accordion>
 
 <Accordion title="Or the single-source-at-a-time CLI (no concurrency, no HF upload)">
