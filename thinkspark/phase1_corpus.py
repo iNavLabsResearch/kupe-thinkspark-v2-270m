@@ -291,6 +291,32 @@ def wait_for_disk_headroom(path: Path, min_free_gb: float, log_fn: Callable[[str
 LOAD_DATASET_TIMEOUT_S = 120.0
 
 
+# Real observed hang, still unresolved by the trust_remote_code fix above: `google/
+# fleurs` itself — not a network blip, not a version mismatch — its OWN loading path
+# (resolving/enumerating its ~100 per-language configs even when only one is requested,
+# apparently) stalls on some networks even though the underlying data is plain Parquet.
+# Confirmed via HF's file-listing API (not guessed): the real layout is exactly
+# `parquet-data/<config>/{train,test,validation}-00000-of-00001.parquet`, and this
+# project's configured `hf_config` values (en_us, hi_in, gu_in) already match those
+# folder names exactly. Loading those parquet files DIRECTLY via the generic "parquet"
+# builder — same bytes, same schema — bypasses fleurs' own loading machinery (and
+# whatever in it is slow/hanging) entirely.
+_FLEURS_PARQUET_GLOB = "hf://datasets/google/fleurs/parquet-data/{config}/{split}-*.parquet"
+
+
+def _dataset_load_spec(spec: "SourceSpec") -> tuple[tuple, dict]:
+    """(positional args, kwargs) for `_load_dataset_with_timeout`/`load_dataset`,
+    special-cased for google/fleurs to load its Parquet files directly (see above)."""
+    if spec.hf_dataset == "google/fleurs" and spec.hf_config:
+        glob = _FLEURS_PARQUET_GLOB.format(config=spec.hf_config, split=spec.split)
+        # A single (non-dict) `data_files` glob is assigned the default split name
+        # "train" by `datasets` regardless of what the file is named on disk — the glob
+        # above already selects the CORRECT file (test/train/validation) by filename
+        # prefix, so `split="train"` here is that fixed default name, not `spec.split`.
+        return ("parquet",), {"data_files": glob, "split": "train"}
+    return (spec.hf_dataset, spec.hf_config), {"split": spec.split}
+
+
 def _load_dataset_with_timeout(*args, timeout: float = LOAD_DATASET_TIMEOUT_S, **kwargs):
     # A `concurrent.futures.ThreadPoolExecutor` was tried here first and is WRONG: its
     # worker threads are non-daemon, so if the call genuinely never returns (a true
@@ -432,11 +458,12 @@ def fetch_source(
     # Kaggle network blip while GETting a parquet shard) — restarting is safe because the
     # skipped_for_resume counter below re-skips already-written rows from the top, same
     # as a normal script restart would.
+    load_args, load_kwargs = _dataset_load_spec(spec)
     for attempt in range(STREAM_RETRY_ATTEMPTS):
         try:
             ds = _load_dataset_with_timeout(
-                spec.hf_dataset, spec.hf_config, split=spec.split,
-                streaming=True, token=hf_token if spec.gated else None,
+                *load_args, streaming=True, token=hf_token if spec.gated else None,
+                **load_kwargs,
             )
         except Exception as e:
             msg = str(e)

@@ -162,6 +162,24 @@ cleanly, unaffected by the reordering).
 </Warning>
 
 <Warning>
+**Final fix — the actual root cause:** none of the above were it. `google/fleurs`'s OWN
+loading path (resolving/enumerating its ~100 per-language configs, apparently, even
+when only one is requested) stalls on some networks — confirmed by it still hanging
+after both fixes above landed. Real fix: bypass fleurs' own loading machinery entirely
+and load its Parquet files directly. Confirmed via HF's file-listing API (not guessed)
+that the real layout is exactly
+`parquet-data/<config>/{train,test,validation}-00000-of-00001.parquet`, and this
+project's `hf_config` values (`en_us`, `hi_in`, `gu_in`) already match those folder
+names exactly — so `google/fleurs` sources now load via
+`load_dataset("parquet", data_files="hf://datasets/google/fleurs/parquet-data/<config>/<split>-*.parquet", streaming=True)`
+instead of going through fleurs' own config resolution at all. Every other source
+(LibriSpeech, Kathbath, Shrutilipi, IndicTTS) is untouched — this only applies to
+`hf_dataset: google/fleurs` specifically. Verified offline: the load-spec builder
+produces the exact right glob for both a `train` and a `validation` split source, and a
+non-fleurs source is provably unaffected (identical args as before).
+</Warning>
+
+<Warning>
 **Real observed bug, now fixed:** `Uploaded` could stay stuck at 0 for an entire run
 with no visible error. Root cause: the upload worker read `HF_TOKEN` from its own
 process environment — if that's missing (very commonly on Kaggle/Jupyter: `!export
