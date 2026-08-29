@@ -53,6 +53,7 @@ missing ones are fetched, so an interrupted fetch just resumes.
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 from pathlib import Path
 
@@ -109,23 +110,73 @@ def _move_flatten(src_root: Path, glob_pattern: str, dest_dir: Path, *, rename=N
 
 
 def fetch_phase1(repo: str, token: str | None, args) -> None:
+    """Fetches BOTH repo layouts a Phase-1 repo might have, since not every uploader
+    script here produces the same one: `scripts/P1_00_sequential.py` uploads Parquet
+    shards (`data/<lang>/*.parquet`, cb0/energy/f0 embedded as columns — the current,
+    recommended layout, see thinkspark.phase1_parquet's module docstring for why); the
+    older `encoded/<lang>/*.npz` + `frames_phase1/*.jsonl` layout (still what
+    `scripts/P1_00_pipeline.py`'s concurrent uploader produces) is fetched too if
+    present. Both land in the exact same local data/encoded + data/frames_phase1
+    layout scripts/06_train_phase1.py reads — mixing languages/sources across the two
+    layouts in one repo is fine."""
     utc_log(f"[phase1] fetching from {repo} ...")
     tmp_dir = ROOT / args.tmp_dir / "phase1_snapshot"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    patterns = ["encoded/**/*.npz", "frames_phase1/*.jsonl"]
+    patterns = ["data/*/*.parquet", "encoded/**/*.npz", "frames_phase1/*.jsonl"]
     if args.with_manifest:
         patterns.append("manifest.jsonl")
 
     snap = _snapshot_download(repo, patterns, token, tmp_dir)
 
     encoded_dir = ROOT / args.encoded_dir
-    n_npz, skip_npz = _move_flatten(snap / "encoded", "*.npz", encoded_dir)
-    utc_log(f"[phase1] encoded: {n_npz} moved, {skip_npz} already present -> {encoded_dir}")
-
     frames_dir = ROOT / args.frames_phase1_dir
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- new layout: Parquet shards, unpacked into the same local layout -------------
+    shard_paths = sorted((snap / "data").glob("*/*.parquet")) if (snap / "data").exists() else []
+    if shard_paths:
+        from thinkspark.phase1_parquet import unpack_shard_to_local
+        by_lang: dict[str, list[Path]] = {}
+        for p in shard_paths:
+            by_lang.setdefault(p.parent.name, []).append(p)
+        for lang, shards in sorted(by_lang.items()):
+            frames_path = frames_dir / f"frames_{lang}.jsonl"
+            already = {json.loads(l)["scenario_id"] for l in frames_path.read_text().splitlines()} \
+                if frames_path.exists() else set()
+            n_new = 0
+            with frames_path.open("a", encoding="utf-8") as fh:
+                for shard in sorted(shards):
+                    n_new += unpack_shard_to_local(shard, encoded_dir, fh, ROOT)
+            # unpack_shard_to_local always appends a frame record per row even if the
+            # .npz already existed locally — that would duplicate rows in frames_<lang>.jsonl
+            # on a re-run, so dedupe by scenario_id against what was already there.
+            if already:
+                lines = frames_path.read_text().splitlines()
+                seen: set[str] = set()
+                deduped = []
+                for l in lines:
+                    rec = json.loads(l)
+                    if rec["scenario_id"] in seen:
+                        continue
+                    seen.add(rec["scenario_id"])
+                    deduped.append(l)
+                frames_path.write_text("\n".join(deduped) + "\n", encoding="utf-8")
+            utc_log(f"[phase1] {lang}: {len(shards)} parquet shard(s) unpacked, "
+                   f"{n_new} new .npz written -> {encoded_dir}")
+
+    # ---- older layout: loose .npz + frames_phase1/*.jsonl ----------------------------
+    n_npz, skip_npz = _move_flatten(snap / "encoded", "*.npz", encoded_dir)
+    if n_npz or skip_npz:
+        utc_log(f"[phase1] encoded (legacy .npz layout): {n_npz} moved, {skip_npz} already present -> {encoded_dir}")
+
     n_frames, skip_frames = _move_flatten(snap / "frames_phase1", "*.jsonl", frames_dir)
-    utc_log(f"[phase1] frames: {n_frames} moved, {skip_frames} already present -> {frames_dir}")
+    if n_frames or skip_frames:
+        utc_log(f"[phase1] frames (legacy layout): {n_frames} moved, {skip_frames} already present -> {frames_dir}")
+
+    if not shard_paths and not n_npz and not skip_npz:
+        utc_log(f"[phase1] ! nothing found in {repo} matching either the Parquet or "
+               f"legacy .npz layout — check the repo actually has Phase-1 data uploaded")
 
     if args.with_manifest:
         manifest_src = snap / "manifest.jsonl"

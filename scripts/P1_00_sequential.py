@@ -11,8 +11,11 @@ control over one language at a time instead of everything overlapping in the bac
         |                (own tqdm bar: clips encoded / pending; split across
         |                 --devices in parallel if you pass more than one GPU)
         v
-    STAGE 3  UPLOAD     — every new .npz + the frames file, fully, to --hf-repo
-        |                (own tqdm bar: files uploaded / pending)
+    STAGE 3  UPLOAD     — pack ALL of this language's encoded clips into a handful of
+        |                self-contained Parquet shards (cb0/energy/f0 embedded
+        |                directly as columns) and upload them in one commit to
+        |                --hf-repo, as data/<lang>/<lang>-shard-NNNNN.parquet
+        |                (own tqdm bar: shards uploaded)
         v
     STAGE 4  CLEANUP    — delete the now-uploaded local .npz (and raw wavs, already
                           deleted right after encoding) to free local/Kaggle disk
@@ -23,18 +26,23 @@ Nothing starts until the stage before it is FULLY done — no overlap, no backgr
 threads guessing at each other's progress. Each stage prints its own separate,
 self-contained tqdm progress bar instead of one shared live dashboard
 (see scripts/P1_00_pipeline.py if you want the concurrent/pipelined version instead —
-same underlying fetch/encode/upload logic, different scheduling).
+same underlying fetch/encode logic, different scheduling; that one still uploads loose
+`.npz` files rather than Parquet shards).
 
-Runs are fully resumable at every stage (same manifest/`.npz`-existence/`hf_sync` DB
-checks as P1_00_pipeline.py) — safe to Ctrl+C and re-run the same command.
+Runs are fully resumable at every stage (same manifest/`.npz`-existence checks as
+P1_00_pipeline.py) — safe to Ctrl+C and re-run the same command. Upload is a full
+re-pack + re-upload of the language's CURRENT local state every run, not incremental —
+see thinkspark.phase1_parquet's module docstring for why (real observed failure with
+per-clip incremental upload: HF/git hard-limits any directory to ~10,000 files, and a
+single language's flat encoded/<lang>/ directory blew past that at real scale).
 
 Output layout matches the TRAINING format exactly — no extra step needed before
 scripts/06_train_phase1.py can use it:
     data/encoded/<lang>/<clip_id>.npz        Mimi cb0 + energy + f0 (actual training input)
     data/frames_phase1/frames_<lang>.jsonl   frame records referencing the .npz above
-uploaded to --hf-repo in that same layout (encoded/<lang>/*.npz, frames_phase1/*.jsonl),
-so scripts/19_fetch_training_data.py on a training machine (e.g. Kaggle) pulls it
-straight into that same local layout with no re-encoding.
+Uploaded to --hf-repo as Parquet shards (data/<lang>/*.parquet) instead, since that's
+what stays clean at scale — scripts/19_fetch_training_data.py unpacks those shards
+straight back into the exact local layout above, so the trainer needs zero changes.
 
     conda activate llms
     pip install datasets soundfile huggingface_hub tqdm
@@ -71,11 +79,93 @@ from _bootstrap import setup
 ROOT = setup()
 
 from thinkspark.config import env
-from thinkspark.db import RunDB
-from thinkspark.hf_upload import create_commit_with_backoff, ensure_repo, npz_repo_path
+from thinkspark.hf_upload import create_commit_with_backoff, ensure_repo
 from thinkspark.phase1_corpus import (
     Phase1CorpusConfig, build_frame_record, existing_written, fetch_source, manifest_path,
 )
+
+DATASET_CARD = """\
+---
+license: cc0-1.0
+language:
+  - en
+  - hi
+  - gu
+tags:
+  - thinkspark-v2-350m
+  - phase1
+  - mimi
+  - audio-tokens
+  - speech
+pretty_name: ThinkSpark-v2-350M Phase-1 Free-Audio Corpus
+---
+
+# ThinkSpark-v2-350M — Phase-1 free-audio training data
+
+Pre-encoded [Mimi](https://huggingface.co/kyutai/mimi) `cb0` (12.5Hz semantic) tokens +
+per-frame `energy`/`f0` prosody, packaged for Phase 1 of ThinkSpark-v2-350M — teaching a
+270M-parameter Gemma-3-based full-duplex floor-controller that a stream of Mimi audio
+tokens carries language + prosody, before Phase 2 teaches it to referee turn-taking.
+
+Sourced from free/open corpora (LibriSpeech, AI4Bharat Kathbath/Shrutilipi, IndicTTS,
+Google FLEURS) via `scripts/P1_00_sequential.py` / `scripts/P1_00_pipeline.py` in the
+[kupe-thinkspark-v2-270m](https://github.com/iNavLabsResearch/kupe-thinkspark-v2-270m)
+repo — see that repo's `configs/phase1_corpus.yaml` for the exact per-language source
+mix, weights, and citations.
+
+## Layout
+
+Each language has its own handful of self-contained Parquet shards:
+
+```
+data/en/en-shard-00000.parquet
+data/en/en-shard-00001.parquet
+...
+data/hi/hi-shard-00000.parquet
+...
+data/gu/gu-shard-00000.parquet
+...
+```
+
+Every row is one clip's full frame record — audio tokens included directly as columns,
+no separate file to join against:
+
+| column | type | meaning |
+|---|---|---|
+| `scenario_id` | string | stable clip id |
+| `behaviour` | string | always `"phase1_free_audio"` here |
+| `language` | string | `en` / `hi` / `gu` |
+| `domain` | string | source dataset id (e.g. `librispeech`, `kathbath`) |
+| `agent_text` | string | always empty for Phase-1 (no agent turn) |
+| `user_text` | string | the clip's transcript |
+| `num_frames` / `audio_frames` | int | frame count (also `len(cb0)`) |
+| `cb0` | list<int64> | Mimi codebook-0 token id, one per 80ms frame |
+| `energy` | list<float32> | log-RMS energy per frame |
+| `f0` | list<float32> | fundamental frequency (Hz), 0 = unvoiced, per frame |
+| `flags` | list<int32> | control-flag id per frame (vocab.CONTROL_FLAG_TO_ID) |
+| `agent_state` | list<int32> | agent-state id per frame (vocab.AGENT_STATE_TO_ID) |
+| `speaking_mask` | list<int32> | 1 = user speaking that frame |
+| `spoken_spans` | list<string> | JSON-encoded spans (empty for Phase-1) |
+
+## Loading
+
+Straight into a training machine's local layout (recommended — no extra code needed,
+matches what `scripts/06_train_phase1.py` in the source repo reads directly):
+```bash
+python scripts/19_fetch_training_data.py --phase1-repo {hf_repo}
+```
+
+Or directly via `datasets`/`pandas`/`pyarrow` if you just want to inspect it:
+```python
+from datasets import load_dataset
+ds = load_dataset("{hf_repo}", data_files="data/en/*.parquet", split="train")
+```
+
+## License
+
+CC0 — free/open source audio only (see the source repo's `configs/phase1_corpus.yaml`
+for each source's own license/citation).
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -301,8 +391,36 @@ def stage_encode(lang: str, cfg: Phase1CorpusConfig, args) -> None:
 # bad repo, network) raises immediately and visibly instead of ever being able to die
 # silently in a background thread. This IS "make sure we upload it properly".
 # --------------------------------------------------------------------------- #
-def stage_upload(lang: str, args, db: RunDB) -> None:
+def _upload_dataset_card(api, args) -> None:
+    """Writes and uploads the Phase-1 dataset card (README.md) — see DATASET_CARD below
+    for the actual content. Small, always safe to re-upload/overwrite."""
+    from huggingface_hub import CommitOperationAdd
+    card_path = ROOT / "data" / "phase1_parquet" / "README.md"
+    card_path.parent.mkdir(parents=True, exist_ok=True)
+    card_path.write_text(DATASET_CARD.replace("{hf_repo}", args.hf_repo), encoding="utf-8")
+    create_commit_with_backoff(
+        api, repo=args.hf_repo,
+        operations=[CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=str(card_path))],
+        commit_message="phase1: update dataset card",
+        max_retries=args.max_retries, base_backoff=args.backoff, max_backoff=args.max_backoff,
+        log_fn=print,
+    )
+
+
+def stage_upload(lang: str, args) -> None:
+    """Packs ALL of this language's currently-encoded local data into a handful of
+    self-contained Parquet shards (cb0/energy/f0 embedded directly as columns — no
+    separate .npz needed in the repo at all) and uploads them in ONE commit, replacing
+    whatever shards existed for this language before.
+
+    Deliberately a FULL re-pack + re-upload every run, not an incremental delta against
+    individually-tracked clip ids (the old per-.npz upload path did that, and hit HF/
+    git's ~10,000-files-per-directory limit at scale — see thinkspark.hf_upload's
+    module docstring). Repacking is cheap (local disk only, seconds even for tens of
+    thousands of clips) so there's no real cost to always uploading the exact current
+    full state instead of tracking deltas — simpler and can't drift out of sync."""
     from huggingface_hub import CommitOperationAdd, HfApi
+    from thinkspark.phase1_parquet import pack_lang_to_parquet
 
     print(f"\n[STAGE 3/4] UPLOAD  {lang}  -> {args.hf_repo}")
     token = env("HF_TOKEN", required=True)   # raises loudly HERE, on the main thread, if unset
@@ -313,83 +431,51 @@ def stage_upload(lang: str, args, db: RunDB) -> None:
     if not frames_path.exists():
         raise SystemExit(f"no {frames_path} — run stage 2 (encode) first for {lang}")
 
-    already_synced = db.hf_synced_ids(args.hf_repo)
-    to_upload: list[tuple[str, Path]] = []
-    with frames_path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            cid = rec["scenario_id"]
-            if cid in already_synced:
-                continue
-            npz_path = ROOT / rec["encoded_path"]
-            if npz_path.exists():
-                to_upload.append((cid, npz_path))
+    print(f"  packing {lang} into Parquet shards...")
+    shard_dir = ROOT / "data" / "phase1_parquet"
+    shards = pack_lang_to_parquet(lang, frames_path, ROOT, shard_dir,
+                                  rows_per_shard=args.rows_per_shard, log_fn=print)
+    if not shards:
+        print(f"[STAGE 3/4] UPLOAD  {lang}  nothing to upload (no encoded clips found).")
+        return
 
-    if not to_upload:
-        print(f"[STAGE 3/4] UPLOAD  {lang}  nothing new — already fully synced.")
-    else:
-        pbar = tqdm(total=len(to_upload), desc=f"upload {lang}", unit="file", colour="green")
-        try:
-            cur, cur_ids = [], []
-            commits = []
-            for cid, path in to_upload:
-                cur.append(CommitOperationAdd(path_in_repo=npz_repo_path(lang, path.name),
-                                              path_or_fileobj=str(path)))
-                cur_ids.append(cid)
-                if len(cur) >= args.files_per_commit:
-                    commits.append((cur, cur_ids))
-                    cur, cur_ids = [], []
-            if cur:
-                commits.append((cur, cur_ids))
+    pbar = tqdm(total=len(shards), desc=f"upload {lang}", unit="shard", colour="green")
+    try:
+        ops = [CommitOperationAdd(path_in_repo=f"data/{lang}/{s.name}", path_or_fileobj=str(s))
+              for s in shards]
+        create_commit_with_backoff(
+            api, repo=args.hf_repo, operations=ops,
+            commit_message=f"phase1: {lang} — {len(shards)} parquet shard(s), full re-upload",
+            max_retries=args.max_retries, base_backoff=args.backoff, max_backoff=args.max_backoff,
+            log_fn=tqdm.write,
+        )
+        pbar.update(len(shards))
+    finally:
+        pbar.close()
+    print(f"[STAGE 3/4] UPLOAD  {lang}  done — {len(shards)} shard(s) uploaded.")
 
-            for i, (ops, ids) in enumerate(commits):
-                tqdm.write(f"  commit {i + 1}/{len(commits)}: {len(ops)} .npz files...")
-                create_commit_with_backoff(
-                    api, repo=args.hf_repo, operations=ops,
-                    commit_message=f"phase1: {lang} encoded batch ({len(ops)} clips)",
-                    max_retries=args.max_retries, base_backoff=args.backoff,
-                    max_backoff=args.max_backoff, log_fn=tqdm.write,
-                )
-                for cid in ids:
-                    db.mark_hf_synced(cid, args.hf_repo)
-                pbar.update(len(ops))
-        finally:
-            pbar.close()
-        print(f"[STAGE 3/4] UPLOAD  {lang}  done — {len(to_upload)} .npz uploaded.")
-
-    # frames file itself — small, always re-upload the current version
-    create_commit_with_backoff(
-        api, repo=args.hf_repo,
-        operations=[CommitOperationAdd(path_in_repo=f"frames_phase1/frames_{lang}.jsonl",
-                                       path_or_fileobj=str(frames_path))],
-        commit_message=f"phase1: {lang} frames ({sum(1 for _ in frames_path.open())} records)",
-        max_retries=args.max_retries, base_backoff=args.backoff, max_backoff=args.max_backoff,
-        log_fn=print,
-    )
-    print(f"[STAGE 3/4] UPLOAD  {lang}  frames_{lang}.jsonl synced. "
-         f"-> https://huggingface.co/datasets/{args.hf_repo}")
+    _upload_dataset_card(api, args)
+    print(f"[STAGE 3/4] UPLOAD  {lang}  -> https://huggingface.co/datasets/{args.hf_repo}")
 
 
 # --------------------------------------------------------------------------- #
-# STAGE 4 — delete local .npz now that they're CONFIRMED uploaded (raw wavs are already
-# deleted right after encoding in stage 2, unless --keep-raw-audio) — frees local/Kaggle
-# disk before the next language, own tqdm bar.
+# STAGE 4 — delete local .npz now that they're safely in the just-uploaded Parquet
+# shards (raw wavs are already deleted right after encoding in stage 2, unless
+# --keep-raw-audio) — frees local/Kaggle disk before the next language, own tqdm bar.
+# Only reached if stage_upload returned WITHOUT raising, so every locally-encoded clip
+# for this language is confirmed already embedded in the shards just committed.
 # --------------------------------------------------------------------------- #
-def stage_cleanup_local(lang: str, args, db: RunDB) -> None:
+def stage_cleanup_local(lang: str, args) -> None:
     if args.keep_local_encoded:
         print(f"\n[STAGE 4/4] CLEANUP  {lang}  skipped (--keep-local-encoded)")
         return
 
-    print(f"\n[STAGE 4/4] CLEANUP  {lang}  deleting local .npz confirmed uploaded...")
+    print(f"\n[STAGE 4/4] CLEANUP  {lang}  deleting local .npz now embedded in the uploaded shards...")
     frames_path = ROOT / args.frames_out_dir / f"frames_{lang}.jsonl"
     if not frames_path.exists():
         print(f"[STAGE 4/4] CLEANUP  {lang}  no frames file — nothing to check.")
         return
 
-    synced = db.hf_synced_ids(args.hf_repo)
     to_delete: list[Path] = []
     with frames_path.open(encoding="utf-8") as f:
         for line in f:
@@ -397,10 +483,9 @@ def stage_cleanup_local(lang: str, args, db: RunDB) -> None:
             if not line:
                 continue
             rec = json.loads(line)
-            if rec["scenario_id"] in synced:
-                p = ROOT / rec["encoded_path"]
-                if p.exists():
-                    to_delete.append(p)
+            p = ROOT / rec["encoded_path"]
+            if p.exists():
+                to_delete.append(p)
 
     if not to_delete:
         print(f"[STAGE 4/4] CLEANUP  {lang}  nothing eligible yet.")
@@ -434,7 +519,12 @@ def main():
     ap.add_argument("--out-dir", default="data/phase1_raw")
     ap.add_argument("--encoded-dir", default="data/encoded")
     ap.add_argument("--frames-out-dir", default="data/frames_phase1")
-    ap.add_argument("--db", default="data/thinkspark_phase1.db")
+    ap.add_argument("--rows-per-shard", type=int, default=2000,
+                    help="frame records packed into each uploaded Parquet shard "
+                        "(default 2000) — keeps HF repo file counts small (a handful "
+                        "of shards per language instead of tens of thousands of loose "
+                        ".npz files, which hit HF/git's ~10,000-files-per-directory "
+                        "limit at real scale)")
     ap.add_argument("--hf-repo", default=None,
                     help="HF dataset repo, e.g. anuj-inavlabs/kupe-thinkspark-270m-phase1-data "
                         "— required unless --no-upload")
@@ -471,7 +561,6 @@ def main():
                         "protect from GIL starvation here; only matters if you pass "
                         "multiple --devices, where shards run concurrently with each "
                         "other)")
-    ap.add_argument("--files-per-commit", type=int, default=200)
     ap.add_argument("--backoff", type=float, default=20.0)
     ap.add_argument("--max-backoff", type=float, default=300.0)
     ap.add_argument("--max-retries", type=int, default=10)
@@ -517,12 +606,8 @@ def main():
     stage_encode(lang, cfg, args)
 
     if not args.no_upload:
-        db = RunDB(ROOT / args.db)
-        try:
-            stage_upload(lang, args, db)
-            stage_cleanup_local(lang, args, db)
-        finally:
-            db.close()
+        stage_upload(lang, args)
+        stage_cleanup_local(lang, args)
 
     print("\n" + "=" * 72)
     print(f"Phase-1 sequential run complete for lang={lang}.")

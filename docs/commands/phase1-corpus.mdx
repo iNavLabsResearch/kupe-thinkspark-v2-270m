@@ -261,11 +261,46 @@ python scripts/P1_00_sequential.py --config configs/phase1_corpus.yaml \
 python scripts/P1_00_sequential.py --config configs/phase1_corpus.yaml \
     --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --lang gu
 ```
-Output layout is exactly the training format — no extra step: `data/encoded/<lang>/*.npz`
-+ `data/frames_phase1/frames_<lang>.jsonl`, uploaded to `--hf-repo` in that same layout,
-ready for `scripts/19_fetch_training_data.py` -> `scripts/06_train_phase1.py` with no
-re-encoding. Fully resumable at every stage — same manifest/`.npz`/`hf_sync` checks as
-the pipelined version. `--no-upload` skips stages 3-4 (download+encode only).
+Locally, output is exactly the training format — no extra step:
+`data/encoded/<lang>/*.npz` + `data/frames_phase1/frames_<lang>.jsonl`. On `--hf-repo`,
+it's uploaded as a handful of self-contained **Parquet shards**
+(`data/<lang>/<lang>-shard-NNNNN.parquet`, cb0/energy/f0 embedded directly as columns —
+see the warning below for why), which `scripts/19_fetch_training_data.py` unpacks
+straight back into that same local layout, so `scripts/06_train_phase1.py` needs zero
+changes. Fully resumable for download/encode; upload is a full re-pack + re-upload of
+the language's current local state every run (see the warning below). `--no-upload`
+skips stages 3-4 (download+encode only).
+
+<Warning>
+**Real observed failure, now fixed:** uploading one loose `.npz` per clip hit HF/git's
+hard limit of ~10,000 files per directory — `encoded/en/` (25,704 clips) blew past it
+mid-upload, and every further commit was rejected with "too many files per directory".
+Fixed by switching the upload format entirely: `scripts/P1_00_sequential.py` now packs a
+language's full frame record — INCLUDING the cb0/energy/f0 arrays, as Parquet list
+columns, no separate `.npz` in the repo at all — into a handful of shard files
+(`--rows-per-shard`, default 2000) and uploads those instead. A 25,704-clip language now
+uploads as ~13 files instead of 25,704. Verified offline with a full byte-exact
+pack -> upload -> fetch -> unpack round-trip through the real `pyarrow` Parquet code
+path (not mocked): every cb0/energy/f0 array and frame field matched exactly, and
+re-fetching was confirmed idempotent (no duplicate records).
+
+If your repo already has data from before this fix (a mix of loose `.npz` files, maybe
+some already bucketed into subfolders): **wipe it and re-upload clean** —
+```bash
+python scripts/P1_00_pipeline.py --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --cleanup
+python scripts/P1_00_sequential.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --lang en
+```
+(then `hi`, `gu` — download/encode are unaffected by any of this, only re-run upload
+actually re-uploads anything; local data is never touched by `--cleanup`). A dataset
+card (`README.md`, with schema + loading instructions) is generated and uploaded
+automatically as part of the upload stage.
+
+Note: `scripts/P1_00_pipeline.py` (the concurrent/pipelined script) still uploads loose
+`.npz` files, just bucketed into per-clip-hash subfolders instead of unpacked flat — not
+yet migrated to Parquet. Prefer `P1_00_sequential.py` if you want the cleaner repo
+layout; `scripts/19_fetch_training_data.py` handles fetching from either.
+</Warning>
 
 <Tip>
 **GPU encoding throughput** — clips are batched (`--encode-batch-size`, default 16) into
