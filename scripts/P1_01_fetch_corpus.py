@@ -173,6 +173,28 @@ def _detect_audio_column(row: dict) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
+# Transient-network resilience for HF streaming (Kaggle's network layer can drop a
+# parquet GET mid-stream — real observed failure: '[Errno 9] Bad file descriptor'
+# while resolving a shard, which also corrupts whatever `row` was mid-flight, making
+# audio/text column auto-detection fail on that ONE row even though the dataset is
+# fine). Two layers of defense, matching the retry-classification pattern already used
+# in thinkspark.tts_soniox / scripts/13_upload_hf.py:
+#   1. column auto-detection tolerates a few bad/incomplete rows before giving up —
+#      a truly missing column fails EVERY row, a transient glitch fails only one.
+#   2. the whole per-source stream is retried (fresh `load_dataset` call) a few times
+#      if the iterator itself dies mid-stream, instead of crashing the whole run.
+_TRANSIENT_MARKERS = ("bad file descriptor", "errno 9", "connection", "timeout",
+                     "temporarily", "reset", "broken pipe", "502", "503", "504")
+_COLUMN_DETECT_ROW_BUDGET = 5     # rows to try before concluding a column truly doesn't exist
+_STREAM_RETRY_ATTEMPTS = 4        # fresh-iterator retries on a transient mid-stream failure
+
+
+def _looks_transient(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _TRANSIENT_MARKERS)
+
+
+# --------------------------------------------------------------------------- #
 def fetch_source(
     cfg: Phase1CorpusConfig,
     lang: str,
@@ -210,23 +232,6 @@ def fetch_source(
     except ImportError:
         raise SystemExit("`soundfile` not installed. `pip install soundfile`.")
 
-    try:
-        ds = load_dataset(
-            spec.hf_dataset, spec.hf_config, split=spec.split,
-            streaming=True, token=hf_token if spec.gated else None,
-        )
-    except Exception as e:
-        msg = str(e)
-        if spec.gated and ("gated" in msg.lower() or "401" in msg or "403" in msg):
-            raise SystemExit(
-                f"'{spec.hf_dataset}' is gated. Visit "
-                f"https://huggingface.co/datasets/{spec.hf_dataset}, log in, and click "
-                f"'Agree and access repository' — then re-run with HF_TOKEN set."
-            )
-        raise SystemExit(f"failed to open {spec.hf_dataset}/{spec.hf_config}: {e}")
-
-    ds = ds.cast_column(spec.audio_col or "audio", Audio(sampling_rate=cfg.sample_rate))
-
     # FLAT per-language dir (not lang/source/) — scripts/00_encode_audio.py globs
     # "*.wav" non-recursively, so this must match exactly what it expects. The source
     # id is folded into the filename instead, so provenance is still visible.
@@ -234,73 +239,154 @@ def fetch_source(
     lang_dir.mkdir(parents=True, exist_ok=True)
 
     written = 0
-    skipped_for_resume = have_n
     audio_col = spec.audio_col
     text_col = spec.text_col
     gender_col = spec.gender_col
-    row_index = -1
+    audio_col_fail_rows = 0    # rows where column auto-detect failed — see _COLUMN_DETECT_ROW_BUDGET
+    text_col_fail_rows = 0
+    last_err: Exception | None = None
 
-    for row in ds:
-        row_index += 1
-        if audio_col is None:
-            audio_col = spec.audio_col or _detect_audio_column(row)
-            if audio_col is None:
+    # Retries the WHOLE stream from a fresh `load_dataset` call if it dies mid-iteration
+    # on a transient error (real observed case: '[Errno 9] Bad file descriptor' from a
+    # Kaggle network blip while GETting a parquet shard) — restarting is safe because the
+    # skipped_for_resume counter below re-skips already-written rows from the top, same
+    # as a normal script restart would.
+    for attempt in range(_STREAM_RETRY_ATTEMPTS):
+        try:
+            ds = load_dataset(
+                spec.hf_dataset, spec.hf_config, split=spec.split,
+                streaming=True, token=hf_token if spec.gated else None,
+            )
+        except Exception as e:
+            msg = str(e)
+            if spec.gated and ("gated" in msg.lower() or "401" in msg or "403" in msg):
                 raise SystemExit(
-                    f"couldn't find an audio column in {spec.hf_dataset}/{spec.hf_config} "
-                    f"— set `audio_col:` explicitly in configs/phase1_corpus.yaml"
+                    f"'{spec.hf_dataset}' is gated. Visit "
+                    f"https://huggingface.co/datasets/{spec.hf_dataset}, log in, and click "
+                    f"'Agree and access repository' — then re-run with HF_TOKEN set."
                 )
-        if text_col is None:
-            text_col = spec.text_col or _pick_column(_TEXT_COL_CANDIDATES, list(row.keys()))
-            if text_col is None:
-                raise SystemExit(
-                    f"couldn't find a transcript column in {spec.hf_dataset}/{spec.hf_config} "
-                    f"(tried {_TEXT_COL_CANDIDATES}) — set `text_col:` explicitly in "
-                    f"configs/phase1_corpus.yaml"
-                )
-        if gender_col is None and cfg.gender_balance:
-            gender_col = spec.gender_col or _pick_column(_GENDER_COL_CANDIDATES, list(row.keys()))
-            # may legitimately stay None (Kathbath/Shrutilipi don't carry gender) — fine
+            if _looks_transient(e) and attempt < _STREAM_RETRY_ATTEMPTS - 1:
+                wait = 2.0 * (attempt + 1)
+                print(f"      transient error opening stream (attempt {attempt + 1}/"
+                     f"{_STREAM_RETRY_ATTEMPTS}): {e} — retrying in {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            raise SystemExit(f"failed to open {spec.hf_dataset}/{spec.hf_config}: {e}")
 
-        if skipped_for_resume > 0:
-            skipped_for_resume -= 1
-            continue  # already saved from a previous run; skip the write, keep streaming
+        ds = ds.cast_column(spec.audio_col or "audio", Audio(sampling_rate=cfg.sample_rate))
+        # `written` (not just `have_n`) must be included here: a fresh stream restarts
+        # from row 0, so it must also re-skip whatever THIS call already wrote in an
+        # earlier attempt before the failure — otherwise a mid-stream restart duplicates
+        # those rows under new clip_ids. Relies on the streaming order being stable
+        # across repeated `load_dataset` calls for the same split (true for HF's default
+        # unshuffled parquet-backed streaming).
+        skipped_for_resume = have_n + written
+        row_index = -1
 
-        audio = row.get(audio_col)
-        if not audio or "array" not in audio:
-            continue
-        arr, sr = audio["array"], audio["sampling_rate"]
-        duration_s = len(arr) / float(sr)
-        if duration_s < cfg.min_clip_seconds or duration_s > cfg.max_clip_seconds:
-            continue
+        try:
+            for row in ds:
+                row_index += 1
 
-        transcript = str(row.get(text_col, "") or "").strip()
-        if not transcript:
-            continue
+                if audio_col is None:
+                    detected = spec.audio_col or _detect_audio_column(row)
+                    if detected is None:
+                        audio_col_fail_rows += 1
+                        if audio_col_fail_rows >= _COLUMN_DETECT_ROW_BUDGET:
+                            raise SystemExit(
+                                f"couldn't find an audio column in {spec.hf_dataset}/"
+                                f"{spec.hf_config} after inspecting "
+                                f"{_COLUMN_DETECT_ROW_BUDGET} rows — set `audio_col:` "
+                                f"explicitly in configs/phase1_corpus.yaml"
+                            )
+                        continue   # might be one transiently-corrupted row — try the next
+                    audio_col = detected
 
-        gender = None
-        if gender_col:
-            raw_g = str(row.get(gender_col, "") or "").lower()
-            if raw_g.startswith("f"):
-                gender = "female"
-            elif raw_g.startswith("m"):
-                gender = "male"
+                if text_col is None:
+                    detected = spec.text_col or _pick_column(_TEXT_COL_CANDIDATES, list(row.keys()))
+                    if detected is None:
+                        text_col_fail_rows += 1
+                        if text_col_fail_rows >= _COLUMN_DETECT_ROW_BUDGET:
+                            raise SystemExit(
+                                f"couldn't find a transcript column in {spec.hf_dataset}/"
+                                f"{spec.hf_config} after inspecting "
+                                f"{_COLUMN_DETECT_ROW_BUDGET} rows (tried "
+                                f"{_TEXT_COL_CANDIDATES}) — set `text_col:` explicitly in "
+                                f"configs/phase1_corpus.yaml"
+                            )
+                        continue
+                    text_col = detected
 
-        clip_id = _clip_id(lang, spec.id, row_index)
-        wav_path = lang_dir / f"{spec.id}_{clip_id}.wav"
-        sf.write(str(wav_path), arr, sr)
+                if gender_col is None and cfg.gender_balance:
+                    gender_col = spec.gender_col or _pick_column(_GENDER_COL_CANDIDATES, list(row.keys()))
+                    # may legitimately stay None (many sources don't carry gender) — fine
 
-        manifest_fh.write(json.dumps({
-            "id": clip_id, "lang": lang, "source": spec.id,
-            "wav_path": _relative_or_absolute(wav_path),
-            "transcript": transcript, "gender": gender,
-            "duration_s": round(duration_s, 3),
-        }, ensure_ascii=False) + "\n")
-        manifest_fh.flush()
+                if skipped_for_resume > 0:
+                    skipped_for_resume -= 1
+                    continue  # already saved from a previous run/attempt; keep streaming
 
-        written += 1
-        have_h += duration_s / 3600.0
-        if have_h >= target_h:
-            break
+                try:
+                    audio = row.get(audio_col)
+                    if not audio or "array" not in audio:
+                        continue
+                    arr, sr = audio["array"], audio["sampling_rate"]
+                    duration_s = len(arr) / float(sr)
+                    if duration_s < cfg.min_clip_seconds or duration_s > cfg.max_clip_seconds:
+                        continue
+
+                    transcript = str(row.get(text_col, "") or "").strip()
+                    if not transcript:
+                        continue
+
+                    gender = None
+                    if gender_col:
+                        raw_g = str(row.get(gender_col, "") or "").lower()
+                        if raw_g.startswith("f"):
+                            gender = "female"
+                        elif raw_g.startswith("m"):
+                            gender = "male"
+
+                    clip_id = _clip_id(lang, spec.id, row_index)
+                    wav_path = lang_dir / f"{spec.id}_{clip_id}.wav"
+                    sf.write(str(wav_path), arr, sr)
+                except Exception as e:
+                    # one corrupted row (same class of transient glitch as a dead stream,
+                    # just caught at the single-row level) — skip it, keep going, don't
+                    # let it take down the whole multi-hour fetch
+                    if _looks_transient(e):
+                        continue
+                    raise
+
+                manifest_fh.write(json.dumps({
+                    "id": clip_id, "lang": lang, "source": spec.id,
+                    "wav_path": _relative_or_absolute(wav_path),
+                    "transcript": transcript, "gender": gender,
+                    "duration_s": round(duration_s, 3),
+                }, ensure_ascii=False) + "\n")
+                manifest_fh.flush()
+
+                written += 1
+                have_h += duration_s / 3600.0
+                if have_h >= target_h:
+                    break
+
+            break   # completed (or hit target) without a fatal stream error — done retrying
+
+        except SystemExit:
+            raise   # a real "column doesn't exist" / gated / etc. — not retryable, surface it
+        except Exception as e:
+            last_err = e
+            if _looks_transient(e) and attempt < _STREAM_RETRY_ATTEMPTS - 1:
+                wait = 2.0 * (attempt + 1)
+                print(f"      transient error mid-stream (attempt {attempt + 1}/"
+                     f"{_STREAM_RETRY_ATTEMPTS}): {e} — {written} clip(s) written so far, "
+                     f"restarting stream in {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            raise SystemExit(
+                f"fetch failed for {spec.hf_dataset}/{spec.hf_config} after "
+                f"{attempt + 1} attempt(s), {written} clip(s) written before the failure "
+                f"(kept — safe to just re-run, it resumes): {e}"
+            ) from last_err
 
     return {"lang": lang, "source": spec.id, "status": "ok",
            "written": written, "have_hours": round(have_h, 3), "target_hours": round(target_h, 3)}
