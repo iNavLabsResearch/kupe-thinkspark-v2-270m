@@ -9,6 +9,12 @@
 # Every source below is free/open (CC0 or a click-through research license) and
 # verified to exist on Hugging Face as of Aug 2026 — see README "Phase-1 sources" for
 # the full citation list and why each one is in the mix.
+#
+# UPDATE (2026-08-29): mozilla-foundation/common_voice_* was pulled from Hugging Face
+# entirely — "Effective October 2025, Mozilla Common Voice datasets are now exclusively
+# available through Mozilla Data Collective" (confirmed live on HF, not a gating/token
+# issue — the repo itself is empty, Viewer disabled, no loading script). It was used in
+# en/hi/gu below; replaced/redistributed per language (see each source's own comment).
 
 target_hours:
   en: 150
@@ -17,8 +23,10 @@ target_hours:
                    # less if sources run dry; the plan already up-weights gu sources
 
 # Aim for ~50/50 gender split (Section 7.3 — the codec does NOT remove bias, your data
-# distribution does). Only enforced where the source actually carries a gender field
-# (Common Voice does; AI4Bharat Kathbath/Shrutilipi mostly don't — see the README note).
+# distribution does). Only enforced where the source actually carries a gender field —
+# none of the current default sources reliably do (LibriSpeech/Kathbath/Shrutilipi/
+# IndicTTS all lack one; FLEURS is small), so this gracefully no-ops for now and balance
+# leans on speaker-count diversity instead. See the README/docs Phase-1 note.
 gender_balance: true
 
 sample_rate: 24000        # matches Mimi's operating rate (thinkspark.mimi_codec)
@@ -34,13 +42,13 @@ max_clip_seconds: 20.0    # drop/trim clips longer than a Phase-2-sized window (
 # --------------------------------------------------------------------------------- #
 sources:
   en:
-    - id: common_voice
-      hf_dataset: mozilla-foundation/common_voice_17_0
-      hf_config: en
-      split: train
-      gated: true                  # https://huggingface.co/datasets/mozilla-foundation/common_voice_17_0
-      weight: 0.60
-      note: "huge speaker/gender/accent diversity (Section 7.2) — has an explicit gender field"
+    - id: librispeech
+      hf_dataset: openslr/librispeech_asr
+      hf_config: clean
+      split: train.clean.360       # ~360h nominal (104k rows) — plenty for a 0.60 weight slice
+      gated: false                 # public, ungated, verified live and streamable
+      weight: 0.60                 # replaces the now-dead common_voice slice (see file header)
+      note: "~1000h public-domain read-speech audiobooks (LibriSpeech); no gender field — falls back to unlabeled, fine, gender_balance just skips it for this source"
     - id: fleurs
       hf_dataset: google/fleurs
       hf_config: en_us
@@ -50,60 +58,53 @@ sources:
       note: "clean, small, great HELD-OUT eval set — also usable for training volume"
 
   hi:
+    # common_voice's 0.25 weight (dead — see file header) is redistributed proportionally
+    # across the remaining three sources (kathbath/shrutilipi/fleurs were 0.35/0.30/0.10 =
+    # 0.75 -> scaled up by 1/0.75 to sum back to 1.0, then rounded to clean numbers).
     - id: kathbath
       hf_dataset: ai4bharat/Kathbath
       hf_config: hindi
       split: train
       gated: false                 # CC0 — https://huggingface.co/datasets/ai4bharat/Kathbath
-      weight: 0.35
+      weight: 0.45
       note: "1684h across 12 Indian languages, read+spontaneous, 203 districts"
     - id: shrutilipi
       hf_dataset: ai4bharat/Shrutilipi
       hf_config: hindi
       split: train
       gated: false                 # https://huggingface.co/datasets/ai4bharat/Shrutilipi
-      weight: 0.30
+      weight: 0.40
       note: "6400h+ mined from All India Radio news bulletins — natural prosody"
-    - id: common_voice
-      hf_dataset: mozilla-foundation/common_voice_17_0
-      hf_config: hi
-      split: train
-      gated: true
-      weight: 0.25
-      note: "speaker-invariance + explicit gender field"
     - id: fleurs
       hf_dataset: google/fleurs
       hf_config: hi_in
       split: train
       gated: false
-      weight: 0.10
+      weight: 0.15
       note: "clean baseline slice"
 
   gu:
+    # common_voice's 0.20 weight (dead — see file header) is redistributed across the
+    # remaining three sources (kathbath/shrutilipi/indictts were 0.35/0.30/0.15 = 0.80 ->
+    # scaled up by 1/0.80, then rounded to clean numbers).
     - id: kathbath
       hf_dataset: ai4bharat/Kathbath
       hf_config: gujarati
       split: train
       gated: false
-      weight: 0.35
+      weight: 0.45
     - id: shrutilipi
       hf_dataset: ai4bharat/Shrutilipi
       hf_config: gujarati
       split: train
       gated: false
-      weight: 0.30
-    - id: common_voice
-      hf_dataset: mozilla-foundation/common_voice_17_0
-      hf_config: gu-IN
-      split: train
-      gated: true
-      weight: 0.20
+      weight: 0.35
     - id: indictts
       hf_dataset: SPRINGLab/IndicTTS_Gujarati
       hf_config: null
       split: train
       gated: false
-      weight: 0.15
+      weight: 0.20
       note: "IIT-Madras studio-quality baseline (Section 7.2's 'IIT-M IndicTTS')"
 
 # Optional, NOT in the default mix: ARTPARK-IISc/Vaani (31k h, 165 districts, huge

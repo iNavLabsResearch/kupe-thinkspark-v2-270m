@@ -10,28 +10,56 @@ enough" argument. This page is the concrete answer to **where does the data come
 from**: real, verified, free sources, streamed on demand by
 `scripts/P1_01_fetch_corpus.py`.
 
+<Warning>
+**Mozilla Common Voice was removed from Hugging Face on 2026-08-29** and is no longer
+part of this mix — see the note right below the table. If you're on an older copy of
+this doc or `configs/phase1_corpus.yaml` that still references it, update both.
+</Warning>
+
 ## The plan
 
 | Language | Target hours | Sources (share of target) |
 |---|---|---|
-| English | 150h | Common Voice 17 (60%) + FLEURS (40%) |
-| Hindi | 150h | Kathbath (35%) + Shrutilipi (30%) + Common Voice 17 (25%) + FLEURS (10%) |
-| Gujarati | 130h | Kathbath (35%) + Shrutilipi (30%) + Common Voice 17 (20%) + IndicTTS-Gujarati (15%) |
+| English | 150h | LibriSpeech (60%) + FLEURS (40%) |
+| Hindi | 150h | Kathbath (45%) + Shrutilipi (40%) + FLEURS (15%) |
+| Gujarati | 130h | Kathbath (45%) + Shrutilipi (35%) + IndicTTS-Gujarati (20%) |
 
 **Total ≈ 430h**, matching the guide's "en 150h + hi 150h + gu 100-150h ≈ 400-450h"
 practical target (Section 7.1) — 100h across three languages (the original v1 number)
 is too thin to be robust; this is the re-derived, real number.
 
+<Accordion title="Why Common Voice is gone, and how the mix changed">
+`mozilla-foundation/common_voice_17_0` (en 60%, hi 25%, gu 20%) was the original source
+for gender-labeled speaker diversity. As of this writing, its HF repo is genuinely
+empty — Hugging Face's own notice: *"Effective October 2025, Mozilla Common Voice
+datasets are now exclusively available through Mozilla Data Collective."* Not a
+gating/token issue — there's no data left in the repo to authenticate into. If you ever
+see `failed to open mozilla-foundation/common_voice_.../en: The directory ... doesn't
+contain any data files`, that confirms it, no amount of `HF_TOKEN` fixes it.
+
+Fixed per language:
+- **en**: Common Voice's 60% replaced with `openslr/librispeech_asr` (public, ~1000h of
+  read English speech, no gating) at the same weight.
+- **hi** / **gu**: Common Voice's share redistributed proportionally across the
+  remaining sources — Kathbath/Shrutilipi/FLEURS were 35/30/10 for hi, now 45/40/15;
+  Kathbath/Shrutilipi/IndicTTS-Gujarati were 35/30/15 for gu, now 45/35/20. No
+  replacement source needed — Kathbath and Shrutilipi are already large enough to
+  absorb it.
+
+Net effect: **the whole default config is now completely ungated** — no `HF_TOKEN`
+needed at all to fetch Phase-1 data.
+</Accordion>
+
 ## Why each source is in the mix
 
 <AccordionGroup>
-  <Accordion title="Mozilla Common Voice 17">
-    [mozilla-foundation/common_voice_17_0](https://huggingface.co/datasets/mozilla-foundation/common_voice_17_0) —
-    huge crowd-sourced speaker/gender/accent diversity. Has an **explicit gender
-    field**, which is the main lever for the 50/50 gender balance Section 7.3 asks for
-    (Phase-1 audio being gender-skewed biases endpointing toward whichever f0 range
-    dominates). **Gated** — click "Agree" once on the dataset page before your
-    `HF_TOKEN` can pull it.
+  <Accordion title="LibriSpeech (OpenSLR)">
+    [openslr/librispeech_asr](https://huggingface.co/datasets/openslr/librispeech_asr) —
+    ~1000h of public-domain read-English-speech audiobooks, the classic ASR benchmark
+    corpus. Public, ungated, verified streamable. No gender field in the HF schema — the
+    fetcher's gender-balance step simply skips it for this source (same graceful
+    fallback Kathbath/Shrutilipi already needed), so gender balance for English leans on
+    FLEURS plus sheer speaker-count diversity in LibriSpeech itself.
   </Accordion>
   <Accordion title="AI4Bharat Kathbath">
     [ai4bharat/Kathbath](https://huggingface.co/datasets/ai4bharat/Kathbath) — 1684h
@@ -54,7 +82,7 @@ is too thin to be robust; this is the re-derived, real number.
     [SPRINGLab/IndicTTS_Gujarati](https://huggingface.co/datasets/SPRINGLab/IndicTTS_Gujarati) —
     studio-quality clean baseline, the "IIT-M IndicTTS" line from Section 7.2. Gujarati
     is the scarcest of the three languages, so this adds a clean anchor on top of the
-    noisier Kathbath/Shrutilipi/Common Voice mix.
+    noisier Kathbath/Shrutilipi mix.
   </Accordion>
 </AccordionGroup>
 
@@ -71,7 +99,6 @@ more accent diversity and have the session budget.
 
 ```bash
 pip install datasets soundfile
-export HF_TOKEN=hf_...
 
 # see the plan without downloading anything:
 python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml --dry-run
@@ -83,12 +110,11 @@ python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml
 python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml --lang hi
 ```
 
-<Warning>
-Common Voice is **gated**. Visit
-[huggingface.co/datasets/mozilla-foundation/common_voice_17_0](https://huggingface.co/datasets/mozilla-foundation/common_voice_17_0),
-log in, and click "Agree and access repository" **once**, in a browser — no token alone
-can do this step. Every other source in the default config is ungated.
-</Warning>
+<Note>
+No `HF_TOKEN` needed — every source in the default config is public and ungated (see
+the Common Voice note above for why that changed). Only set `HF_TOKEN` if you add back
+a gated source yourself (`gated: true` in a `sources:` entry).
+</Note>
 
 ## How it stays bounded on Kaggle
 
@@ -105,7 +131,7 @@ flowchart LR
     check -->|yes| stop["stop — move to<br/>next source"]
 ```
 
-So even though Shrutilipi alone is 6400h+, this config only ever pulls the ~45-50h its
+So even though Shrutilipi alone is 6400h+, this config only ever pulls the ~45-68h its
 `weight` asks for per language — disk and bandwidth stay proportional to what you
 actually need, not to the upstream dataset's real size.
 
@@ -123,9 +149,12 @@ The Mimi codec does **not** remove speaker bias — your data distribution does 
 7.3). Turn-taking cues (final lengthening, pitch fall) sit at different f0 ranges for
 different genders/ages. If Phase-1 audio is male-heavy, endpointing gets biased and
 clips female/child voices. `gender_balance: true` in `configs/phase1_corpus.yaml`
-targets ~50/50 wherever the source provides a gender field (mainly Common Voice —
-Kathbath/Shrutilipi mostly don't carry one, so exact balance leans on the Common Voice
-slice plus the sheer speaker-count diversity across all four sources).
+targets ~50/50 wherever the source provides a gender field. None of the current default
+sources carry one reliably (LibriSpeech, Kathbath, Shrutilipi, IndicTTS all lack an
+explicit field; FLEURS is small) — the fetcher's gender step gracefully no-ops when a
+source has no gender column, so balance here leans on the sheer number/diversity of
+speakers across sources rather than an explicit label. Add a source with a real gender
+field (via a custom `sources:` entry) if exact 50/50 matters more than that for your run.
 </Warning>
 
 <Card title="Next: build frames from what you fetched" icon="waveform-lines" href="/commands/preprocessing">

@@ -7,14 +7,16 @@ closes it with real, verified sources (see configs/phase1_corpus.yaml for citati
 
 Sources per language (see configs/phase1_corpus.yaml, each entry has a `weight` and a
 `note` explaining why it's in the mix):
-    en   Common Voice 17 (60%) + FLEURS (40%)
-    hi   Kathbath (35%) + Shrutilipi (30%) + Common Voice 17 (25%) + FLEURS (10%)
-    gu   Kathbath (35%) + Shrutilipi (30%) + Common Voice 17 (20%) + IndicTTS-Gujarati (15%)
+    en   LibriSpeech (60%) + FLEURS (40%)
+    hi   Kathbath (45%) + Shrutilipi (40%) + FLEURS (15%)
+    gu   Kathbath (45%) + Shrutilipi (35%) + IndicTTS-Gujarati (20%)
 
-All are free (CC0 or a click-through research license). Common Voice is **gated** on
-Hugging Face — you must (a) set HF_TOKEN and (b) click "Agree" once on the dataset's HF
-page in a browser before the token can pull it; the script gives you the exact URL if
-you haven't.
+All free (CC0 or a click-through research license), and — as of this config — none
+gated. (Common Voice was the one gated source here; it was removed entirely on
+2026-08-29 after Mozilla pulled it off Hugging Face — "Effective October 2025, Mozilla
+Common Voice datasets are now exclusively available through Mozilla Data Collective."
+Not a token/gating issue, the HF repo itself is empty. See configs/phase1_corpus.yaml's
+header comment for the full story and what replaced/absorbed its weight per language.)
 
 Built for Kaggle's constraints: every source is streamed (`datasets` library,
 `streaming=True`) so nothing downloads more than what's needed — we stop per-source the
@@ -28,7 +30,7 @@ re-saved) and the run continues toward the same per-source target.
 
     conda activate llms
     pip install datasets soundfile
-    export HF_TOKEN=hf_...     # required for the gated Common Voice source
+    # no HF_TOKEN needed — every default source is public/ungated
 
     # 1. see the plan without downloading anything:
     python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml --dry-run

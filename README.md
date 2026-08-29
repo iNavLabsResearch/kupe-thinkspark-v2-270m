@@ -394,25 +394,49 @@ instead.
 ### 4 · Get the Phase-1 free corpus (Section 7)
 ```bash
 pip install datasets soundfile
-export HF_TOKEN=hf_...     # also needed for the gated Common Voice source, see below
 
 python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml --dry-run  # see the plan first
 python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml            # fetch (resumable)
 ```
-Streams (never fully downloads) the real, verified sources from Section 7.2 — per
-language, stops the moment its target hours are reached, so disk/bandwidth stay bounded
-on Kaggle regardless of how huge the upstream dataset is:
+Streams (never fully downloads) the real, verified sources — per language, stops the
+moment its target hours are reached, so disk/bandwidth stay bounded on Kaggle regardless
+of how huge the upstream dataset is. **No `HF_TOKEN` needed at all** — every source below
+is public/ungated:
+
+<details>
+<summary><b>Common Voice was removed from this mix on 2026-08-29 — Mozilla pulled it off Hugging Face entirely</b></summary>
+
+`mozilla-foundation/common_voice_17_0` (and every other Common Voice version) was used
+here for en/hi/gu. As of this writing, the HF repo itself is genuinely empty — "the
+Dataset Viewer is disabled pending file uploads" and Hugging Face's own notice reads:
+"Effective October 2025, Mozilla Common Voice datasets are now exclusively available
+through Mozilla Data Collective." This is **not** a gating/token/permissions issue — a
+correct `HF_TOKEN` plus clicking "Agree" won't fix it, because there's no data left in
+the repo to agree into. If you hit `failed to open mozilla-foundation/common_voice_.../
+en: The directory ... doesn't contain any data files`, that confirms it.
+
+Fixed by removing Common Voice everywhere and either substituting or redistributing its
+share:
+- **en**: replaced with `openslr/librispeech_asr` (public, ~1000h of read English
+  speech, no gating) at the same 60% weight.
+- **hi** / **gu**: Common Voice's share was redistributed proportionally across the
+  remaining sources (Kathbath/Shrutilipi/FLEURS for hi; Kathbath/Shrutilipi/IndicTTS-
+  Gujarati for gu) — no replacement needed, those sources are already large enough to
+  absorb it.
+</details>
 
 | Lang | Sources (share of target hours) | Target |
 |---|---|---|
-| en | Common Voice 17 (60%) + FLEURS (40%) | 150h |
-| hi | Kathbath (35%) + Shrutilipi (30%) + Common Voice 17 (25%) + FLEURS (10%) | 150h |
-| gu | Kathbath (35%) + Shrutilipi (30%) + Common Voice 17 (20%) + IndicTTS-Gujarati (15%) | 130h |
+| en | LibriSpeech (60%) + FLEURS (40%) | 150h |
+| hi | Kathbath (45%) + Shrutilipi (40%) + FLEURS (15%) | 150h |
+| gu | Kathbath (45%) + Shrutilipi (35%) + IndicTTS-Gujarati (20%) | 130h |
 
-<sup>[mozilla-foundation/common_voice_17_0](https://huggingface.co/datasets/mozilla-foundation/common_voice_17_0) (gated — click "Agree" once) · [ai4bharat/Kathbath](https://huggingface.co/datasets/ai4bharat/Kathbath) · [ai4bharat/Shrutilipi](https://huggingface.co/datasets/ai4bharat/Shrutilipi) · [google/fleurs](https://huggingface.co/datasets/google/fleurs) · [SPRINGLab/IndicTTS_Gujarati](https://huggingface.co/datasets/SPRINGLab/IndicTTS_Gujarati)</sup>
+<sup>[openslr/librispeech_asr](https://huggingface.co/datasets/openslr/librispeech_asr) · [ai4bharat/Kathbath](https://huggingface.co/datasets/ai4bharat/Kathbath) · [ai4bharat/Shrutilipi](https://huggingface.co/datasets/ai4bharat/Shrutilipi) · [google/fleurs](https://huggingface.co/datasets/google/fleurs) · [SPRINGLab/IndicTTS_Gujarati](https://huggingface.co/datasets/SPRINGLab/IndicTTS_Gujarati)</sup>
 
-All free (CC0 or a one-click research license). Writes wavs + a resumable
-`data/phase1_raw/manifest.jsonl` (transcript + gender where the source provides it).
+All free (CC0 or a one-click research license), none gated. Writes wavs + a resumable
+`data/phase1_raw/manifest.jsonl` (transcript + gender where the source provides it —
+LibriSpeech doesn't carry a gender field, which the fetcher handles gracefully, same as
+Kathbath/Shrutilipi already did).
 
 ### 5 · Phase 0 — encode audio to Mimi (Section 4.2)
 ```bash
@@ -531,12 +555,12 @@ artifacts/             checkpoints (git-ignored)
 ## Not included / bring your own
 
 - ~~Phase-1 free corpora~~ — **no longer bring-your-own.** `scripts/P1_01_fetch_corpus.py`
-  streams the real sources (Common Voice 17, AI4Bharat Kathbath + Shrutilipi, Google
-  FLEURS, IndicTTS-Gujarati — see step 4 above) and stops per-source once its target
-  hours are reached, so bandwidth/disk stay bounded on Kaggle regardless of how huge the
-  upstream dataset is. The one manual step: Common Voice is gated, so you click "Agree"
-  once on its HF page before your `HF_TOKEN` can pull it. The referee never trains on
-  agent audio, in either phase.
+  streams the real sources (LibriSpeech, AI4Bharat Kathbath + Shrutilipi, Google FLEURS,
+  IndicTTS-Gujarati — see step 4 above) and stops per-source once its target hours are
+  reached, so bandwidth/disk stay bounded on Kaggle regardless of how huge the upstream
+  dataset is. **No manual step needed** — every default source is public/ungated (Common
+  Voice was removed from Hugging Face entirely and dropped from this mix; see step 4's
+  note). The referee never trains on agent audio, in either phase.
 - **Exact Soniox TTS field names.** The transport is isolated in
   `thinkspark/tts_soniox.py::_synthesize_ws`; verify the current route/fields against
   soniox.com/docs before a large paid run. Everything downstream depends only on the

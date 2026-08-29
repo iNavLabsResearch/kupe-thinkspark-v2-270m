@@ -107,7 +107,8 @@ python scripts/17_audio_summary.py
 
 ```bash
 pip install datasets soundfile
-export HF_TOKEN=hf_...     # also unlocks the gated Common Voice source (click "Agree" once on its HF page)
+# no HF_TOKEN needed — every default source is public/ungated (Common Voice was removed
+# from Hugging Face and dropped from this mix, see /commands/phase1-corpus)
 
 # fetch the real, verified free corpus (streamed, stops per-source at target hours):
 python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml --dry-run
@@ -177,7 +178,7 @@ and executed piece by piece, not blindly piped through in one sitting.
 | `scripts/11_monitor.py` | data-gen | live dashboard: cost, latency, unit-eval, pass/fail, ETA |
 | `scripts/12_build_report.py` | data-gen | HTML chart report — actual vs. target, cumulative spend |
 | `scripts/10_export_costs.py` | data-gen | CSV cost export from the SQLite log |
-| `scripts/P1_01_fetch_corpus.py` | phase1-corpus | streams Common Voice/Kathbath/Shrutilipi/FLEURS/IndicTTS |
+| `scripts/P1_01_fetch_corpus.py` | phase1-corpus | streams LibriSpeech/Kathbath/Shrutilipi/FLEURS/IndicTTS |
 | `scripts/P1_02_build_frames.py` | phase1-corpus | manifest + Mimi shards → Phase-1 frame records |
 | `scripts/00_encode_audio.py` | preprocessing | wav → Mimi cb0 + energy + f0 |
 | `scripts/04_build_frames.py` | preprocessing | scenarios + timestamps → per-frame labels (Phase 2) |
