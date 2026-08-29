@@ -181,12 +181,36 @@ class MimiEncoder:
             )
             valid_lens = [codes.shape[-1]] * len(processed)
 
+        # ---- prosody, BATCHED (the actual throughput fix) -------------------------
+        # The old code called _prosody() per clip inside this loop, and _prosody's f0
+        # step (torchaudio detect_pitch_frequency) ran on a SINGLE-CLIP CPU tensor every
+        # time — so batching the GPU encode above changed nothing, because f0 stayed
+        # fully serial on the CPU (real observed result: an L4 stuck at ~2 clips/sec even
+        # WITH batch_size=16, because the GPU was never the bottleneck — f0 was). Now f0
+        # is computed for the WHOLE batch in one GPU call, reusing the padded input
+        # tensor that's already on the device, and energy is vectorized. This is where
+        # the real speedup comes from.
+        f0_batch = _f0_batch_gpu(input_values, _MIMI_RATE, torch)   # (np [B,P], T_pad) or None
+
+        codes_cpu = codes.detach().cpu().numpy()
         results = []
         for i, wav in enumerate(processed):
             n = int(valid_lens[i])
             assert 0 < n <= codes.shape[-1], f"invalid trimmed length {n} (max {codes.shape[-1]})"
-            cb0 = codes[i, 0, :n].detach().cpu().numpy().astype(np.int64)
-            energy, f0 = _prosody(wav, _MIMI_RATE, num_frames=len(cb0))
+            cb0 = codes_cpu[i, 0, :n].astype(np.int64)
+            energy = _energy_frames(wav, len(cb0))
+            if f0_batch is not None:
+                pitch_np, t_pad = f0_batch
+                p_total = pitch_np.shape[1]
+                # detect_pitch_frequency's frame count is ~linear in input length, so the
+                # valid (unpadded) portion of clip i is the first ~len(wav)/t_pad of its
+                # pitch frames — slice to that before resizing, or the right-padding's
+                # silence (f0=0) would leak into a shorter clip's real frames.
+                valid_p = max(1, int(round(p_total * len(wav) / t_pad)))
+                f0 = _resize_1d(pitch_np[i, :valid_p].astype(np.float32), len(cb0))
+            else:
+                # torchaudio unavailable / GPU f0 failed — fall back to the per-clip path
+                f0 = _estimate_f0(wav, _MIMI_RATE, len(cb0), _HOP)
             results.append(EncodedAudio(cb0=cb0, energy=energy, f0=f0, num_frames=len(cb0)))
         return results
 
@@ -194,17 +218,46 @@ class MimiEncoder:
 # --------------------------------------------------------------------------- #
 # prosody + io helpers (kept torch-free where possible)
 # --------------------------------------------------------------------------- #
-def _prosody(wav: np.ndarray, sr: int, num_frames: int):
-    """Per-frame log-RMS energy and f0 (Hz), aligned to Mimi's frame grid."""
+def _energy_frames(wav: np.ndarray, num_frames: int) -> np.ndarray:
+    """Per-frame log-RMS energy, vectorized (no Python per-frame loop). Reshapes the
+    waveform into `num_frames` blocks of `_HOP` samples and takes RMS along each — same
+    result as the old element-by-element loop, but done in one numpy op."""
     hop = _HOP
-    energy = np.zeros(num_frames, dtype=np.float32)
-    for i in range(num_frames):
-        seg = wav[i * hop:(i + 1) * hop]
-        if seg.size:
-            energy[i] = np.sqrt(np.mean(seg.astype(np.float64) ** 2) + 1e-9)
-    energy = np.log(energy + 1e-6).astype(np.float32)
+    total = num_frames * hop
+    w = wav[:total]
+    if w.shape[0] < total:
+        w = np.pad(w, (0, total - w.shape[0]))
+    frames = w.reshape(num_frames, hop).astype(np.float64)
+    rms = np.sqrt((frames ** 2).mean(axis=1) + 1e-9)
+    return np.log(rms + 1e-6).astype(np.float32)
 
-    f0 = _estimate_f0(wav, sr, num_frames, hop)
+
+def _f0_batch_gpu(input_values, sr: int, torch):
+    """f0 for a WHOLE batch in one torchaudio call, on whatever device `input_values` is
+    on (the GPU, here) — reuses the already-padded encoder input tensor so there's no
+    extra copy. Returns (pitch_numpy[B, P], padded_length) or None if torchaudio isn't
+    available / the call fails (caller then falls back to the per-clip CPU path).
+    Amplitude scaling by the feature extractor is irrelevant: pitch is a frequency, so
+    a normalized waveform gives the same f0 as the raw one."""
+    try:
+        import torchaudio.functional as AF
+
+        wav = input_values
+        if wav.dim() == 3:
+            wav = wav.squeeze(1)          # (B, 1, T) -> (B, T)
+        with torch.no_grad():
+            pitch = AF.detect_pitch_frequency(wav, sr)   # (B, P), batched on-device
+        return pitch.detach().cpu().numpy(), int(wav.shape[-1])
+    except Exception:
+        return None
+
+
+def _prosody(wav: np.ndarray, sr: int, num_frames: int):
+    """Per-frame log-RMS energy and f0 (Hz), aligned to Mimi's frame grid. Single-clip
+    path (encode_waveform); the batched encode_batch computes both prosody streams in
+    bulk instead — see _energy_frames / _f0_batch_gpu."""
+    energy = _energy_frames(wav, num_frames)
+    f0 = _estimate_f0(wav, sr, num_frames, _HOP)
     return energy, f0
 
 

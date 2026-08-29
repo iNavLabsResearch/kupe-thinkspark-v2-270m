@@ -280,6 +280,15 @@ afterward — tested offline with real variable-length audio. Raise `--encode-ba
 you hit an out-of-memory error. A batch that fails falls back to encoding its clips one
 at a time automatically, so one bad clip never costs the rest of a batch — verified
 offline.
+
+The GPU forward pass was never actually the bottleneck, though — the real one was **f0
+(pitch) extraction**, which ran per clip on a single-clip CPU tensor even inside a batch,
+so the first pass at batching changed nothing (an L4 stayed at ~2 clips/sec even at
+batch-size 16). Fixed: f0 now runs once for the whole batch on the GPU (reusing the
+padded encoder-input tensor already on-device), and energy is vectorized instead of a
+Python per-frame loop. Falls back to the per-clip CPU path only if torchaudio is
+unavailable. Verified offline that f0 is computed once per batch (not per clip) and all
+prosody streams stay length-consistent with the trimmed cb0.
 </Tip>
 </Accordion>
 
