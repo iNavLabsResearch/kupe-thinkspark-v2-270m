@@ -7,16 +7,18 @@ fetch logic rather than risking it drifting between two copies.
 See scripts/P1_01_fetch_corpus.py's module docstring for the full source list and the
 Common Voice removal story; configs/phase1_corpus.yaml for the per-language source mix.
 
-Audio decode shape: `datasets`' Audio-cast columns come back as EITHER an older plain
-dict (`{"array": np.ndarray, "sampling_rate": int}`, soundfile-based decode) OR a
-torchcodec `AudioDecoder` object (current `datasets` default once torchcodec + a working
-FFmpeg are installed — real, documented API: `.get_all_samples()` -> `AudioSamples` with
-`.data` (channel-first torch.Tensor) and `.sample_rate`, verified against
-meta-pytorch.org/torchcodec, not guessed). `detect_audio_column`/`extract_waveform`
-handle both — this project hit the real failure mode of only handling the old shape
-(worked fine before torchcodec was installed/working, then broke as
-"couldn't find an audio column" the moment FFmpeg got fixed and `datasets` switched to
-real torchcodec decoding).
+Audio is ALWAYS raw bytes/path + `soundfile`. This project does not use torchcodec.
+
+`datasets` 4.x wants to decode Audio columns via torchcodec, which needs torch>=2.5
+and a matching FFmpeg .so — neither is true on the boxes this pipeline actually
+runs on (real crash: torch 2.4.1+cu124 + torchcodec 0.10.0 -> libavutil missing +
+`Aborted (core dumped)`). English already finished without torchcodec; hi/gu must
+use the same path.
+
+Do NOT `cast_column(..., Audio(decode=False))` to "disable" decoding — on datasets
+4.x that still runs `Audio.encode_example()`, which imports torchcodec UNCONDITIONALLY
+(before it even looks at `decode`). Disable decode by mutating the existing feature
+flag in place, and decode the `{bytes, path}` dict ourselves with soundfile.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ import yaml
 # rather auto-detect than hard-crash on a guess that turns out wrong for one source.
 _TEXT_COL_CANDIDATES = ["sentence", "text", "transcription", "transcript", "normalized_text"]
 _GENDER_COL_CANDIDATES = ["gender", "sex", "speaker_gender"]
+_AUDIO_COL_CANDIDATES = ["audio", "audio_filepath", "audio_path", "wav", "speech"]
 
 
 # --------------------------------------------------------------------------- #
@@ -149,70 +152,157 @@ def relative_or_absolute(path: Path, root: Path) -> str:
         return str(path)
 
 
+_AUDIO_SUFFIXES = (".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".pcm")
+
+
+def _looks_like_audio_path(v: str) -> bool:
+    lower = v.lower()
+    return any(lower.endswith(s) for s in _AUDIO_SUFFIXES)
+
+
 def _is_audio_value(v) -> bool:
-    """True for any shape `datasets` hands back for an Audio-cast column: the older
-    dict `{"array": ..., "sampling_rate": ...}` (soundfile-based decode), a torchcodec
-    `AudioDecoder` object (duck-typed via `get_all_samples`, since isinstance-checking a
-    lazily-imported torchcodec class would force-import torchcodec even for sources that
-    don't need it), or the RAW (undecoded) `{"bytes": ..., "path": ...}` shape this
-    project now requests via `Audio(decode=False)` — see `fetch_source`'s cast_column
-    call for why: `datasets`' own decoding (both the old soundfile path and the new
-    torchcodec path) turned out to be a real, repeated source of environment breakage
-    (torchcodec categorically doesn't support torch<2.5, hit on a real RunPod image
-    running torch 2.4.1 — no torchcodec version fixes that, confirmed against
-    torchcodec's own compatibility table). Decoding the raw bytes ourselves with plain
-    `soundfile` — a dependency this project already has everywhere, zero torch/CUDA
-    coupling — sidesteps that whole class of bug permanently."""
-    if isinstance(v, dict) and "array" in v and "sampling_rate" in v:
+    """True for raw audio shapes this project decodes with soundfile — never
+    torchcodec `AudioDecoder` (that path imports libtorchcodec and crashes on
+    torch<2.5 / missing FFmpeg). Strings are only audio if they look like a
+    media path — a transcript/speaker-id string must not win column detection."""
+    if isinstance(v, dict):
+        if "array" in v and "sampling_rate" in v:
+            return True
+        if "bytes" in v or "path" in v:
+            return True
+        return False
+    if isinstance(v, (bytes, bytearray)):
         return True
-    if isinstance(v, dict) and "bytes" in v and "path" in v:
-        return True
-    return hasattr(v, "get_all_samples")
+    if isinstance(v, str) and v:
+        return _looks_like_audio_path(v)
+    return hasattr(v, "_hf_encoded")
 
 
 def detect_audio_column(row: dict) -> str | None:
+    for name in _AUDIO_COL_CANDIDATES:
+        if name in row and row[name] is not None:
+            return name
     for k, v in row.items():
         if _is_audio_value(v):
             return k
     return None
 
 
+def _read_with_soundfile(raw, path) -> tuple:
+    """Decode wav/flac/ogg bytes or a local/remote path. Returns (None, None) if
+    neither is usable — never falls through to torchcodec."""
+    import io
+
+    import numpy as np
+    import soundfile as sf
+
+    if raw:
+        arr, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+        return np.asarray(arr, dtype=np.float32), int(sr)
+    if not path:
+        return None, None
+    if os.path.isfile(path):
+        arr, sr = sf.read(path, dtype="float32", always_2d=False)
+        return np.asarray(arr, dtype=np.float32), int(sr)
+    if path.startswith(("hf://", "https://", "http://")) or "::" in path:
+        try:
+            from datasets.utils.file_utils import xopen
+            with xopen(path, "rb") as fh:
+                raw = fh.read()
+        except Exception:
+            return None, None
+        if not raw:
+            return None, None
+        arr, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+        return np.asarray(arr, dtype=np.float32), int(sr)
+    return None, None
+
+
 def extract_waveform(audio_value) -> tuple:
-    """
-    Returns (numpy_array, sample_rate) for any shape `_is_audio_value` accepts.
-    Verified against torchcodec's real, documented API (meta-pytorch.org/torchcodec —
-    NOT guessed) for the AudioDecoder shape: `AudioDecoder.get_all_samples()` ->
-    `AudioSamples`, whose `.data` is a `torch.Tensor` shaped (num_channels, num_samples)
-    in [-1, 1], and `.sample_rate` is an int. soundfile wants (num_samples,) for mono or
-    (num_samples, num_channels) for multi-channel, so channel-first torch layout is
-    transposed/squeezed accordingly. Returns (None, None) if `audio_value` doesn't match
-    any known shape.
-    """
+    """Returns (numpy_array, sample_rate) from raw bytes/path/array. Never calls
+    torchcodec (`get_all_samples` is intentionally not used). (None, None) if
+    the value isn't a known raw-audio shape."""
     import numpy as np
 
-    if isinstance(audio_value, dict) and "array" in audio_value and "sampling_rate" in audio_value:
+    if audio_value is None:
+        return None, None
+    if hasattr(audio_value, "_hf_encoded") and audio_value._hf_encoded:
+        return extract_waveform(audio_value._hf_encoded)
+    if isinstance(audio_value, (bytes, bytearray)):
+        return _read_with_soundfile(bytes(audio_value), None)
+    if isinstance(audio_value, str):
+        return _read_with_soundfile(None, audio_value)
+    if not isinstance(audio_value, dict):
+        return None, None
+    if "array" in audio_value and "sampling_rate" in audio_value:
         return np.asarray(audio_value["array"], dtype=np.float32), int(audio_value["sampling_rate"])
-    if isinstance(audio_value, dict) and "bytes" in audio_value and "path" in audio_value:
-        import io
+    return _read_with_soundfile(audio_value.get("bytes"), audio_value.get("path"))
 
-        import soundfile as sf
 
-        raw = audio_value.get("bytes")
-        if raw is not None:
-            arr, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
-        else:
-            path = audio_value.get("path")
-            if not path:
-                return None, None
-            arr, sr = sf.read(path, dtype="float32", always_2d=False)
-        return np.asarray(arr, dtype=np.float32), int(sr)
-    if hasattr(audio_value, "get_all_samples"):
-        samples = audio_value.get_all_samples()
-        arr = samples.data.numpy()
-        if arr.ndim == 2:
-            arr = arr[0] if arr.shape[0] == 1 else arr.T   # (channels, N) -> mono (N,) or (N, channels)
-        return arr.astype(np.float32), int(samples.sample_rate)
-    return None, None
+def _set_decode_false(feat) -> None:
+    """Walk a `datasets` feature tree and flip every media `decode` flag off."""
+    if getattr(feat, "decode", None) is True:
+        feat.decode = False
+    inner = getattr(feat, "feature", None)
+    if inner is not None:
+        _set_decode_false(inner)
+    if isinstance(feat, dict):
+        for v in feat.values():
+            _set_decode_false(v)
+
+
+def _disable_media_decode(ds):
+    """Stop `datasets` from decoding Audio/Image/Video columns.
+
+    Mutates existing features IN PLACE. Do not `cast_column` / `cast` to
+    `Audio(decode=False)` — datasets 4.x implements that via `Audio.encode_example()`,
+    which does `from torchcodec.encoders import AudioEncoder` before it even
+    inspects `self.decode`. That is the exact crash on hi/gu (Kathbath) after
+    English already succeeded without torchcodec.
+    """
+    seen_ids: set[int] = set()
+    for obj in (ds, getattr(ds, "info", None), getattr(ds, "_info", None)):
+        if obj is None:
+            continue
+        feats = getattr(obj, "features", None)
+        if feats is None or id(feats) in seen_ids:
+            continue
+        seen_ids.add(id(feats))
+        values = feats.values() if hasattr(feats, "values") else []
+        for feat in values:
+            _set_decode_false(feat)
+    return ds
+
+
+def _patch_datasets_audio_no_torchcodec() -> None:
+    """Make `datasets.Audio` encode/decode a no-op so a later accidental
+    `cast_column` / `decode_example` cannot import torchcodec."""
+    try:
+        from datasets.features.audio import Audio
+    except ImportError:
+        return
+
+    def _identity_decode(self, value, token_per_repo_id=None):
+        return value
+
+    def _identity_encode(self, value):
+        if value is None:
+            return {"bytes": None, "path": None}
+        if isinstance(value, (bytes, bytearray)):
+            return {"bytes": bytes(value), "path": None}
+        if isinstance(value, str):
+            return {"bytes": None, "path": value}
+        if isinstance(value, dict):
+            if "bytes" in value or "path" in value:
+                return {"bytes": value.get("bytes"), "path": value.get("path")}
+            return value
+        encoded = getattr(value, "_hf_encoded", None)
+        if isinstance(encoded, dict):
+            return encoded
+        return value
+
+    Audio.decode_example = _identity_decode
+    Audio.encode_example = _identity_encode
 
 
 # --------------------------------------------------------------------------- #
@@ -456,7 +546,7 @@ def fetch_source(
                "gated": spec.gated}
 
     try:
-        from datasets import Audio
+        import datasets  # noqa: F401  — import must succeed; we never use Audio()
     except ImportError:
         raise SystemExit("`datasets` not installed. `pip install datasets soundfile`.")
 
@@ -464,6 +554,8 @@ def fetch_source(
         import soundfile as sf
     except ImportError:
         raise SystemExit("`soundfile` not installed. `pip install soundfile`.")
+
+    _patch_datasets_audio_no_torchcodec()
 
     # FLAT per-language dir (not lang/source/) — scripts/00_encode_audio.py globs
     # "*.wav" non-recursively, so this must match exactly what it expects. The source
@@ -488,7 +580,7 @@ def fetch_source(
     for attempt in range(STREAM_RETRY_ATTEMPTS):
         try:
             ds = _load_dataset_with_timeout(
-                *load_args, streaming=True, token=hf_token if spec.gated else None,
+                *load_args, streaming=True, token=hf_token,
                 **load_kwargs,
             )
         except Exception as e:
@@ -507,19 +599,9 @@ def fetch_source(
                 continue
             raise SystemExit(f"failed to open {spec.hf_dataset}/{spec.hf_config}: {e}")
 
-        # `decode=False`: get the RAW (undecoded) bytes instead of letting `datasets`
-        # decode the audio itself. Real, repeated breakage avoided by this: `datasets`'
-        # decode path now requires `torchcodec`, which categorically doesn't support
-        # torch<2.5 (no version fixes that — confirmed against its own compatibility
-        # table, hit on a real box running torch 2.4.1) and separately hit CUDA-version-
-        # specific `libnvrtc`/`libavutil` shared-library failures even when a compatible
-        # version WAS installed. `extract_waveform()` decodes the raw bytes itself via
-        # plain `soundfile` instead — a dependency this project already uses everywhere,
-        # with zero torch/CUDA/FFmpeg-version coupling. No `sampling_rate=` resample
-        # here either: MimiEncoder.encode_waveform already resamples to its own 24kHz
-        # operating rate internally, so requesting one here would be redundant work for
-        # no benefit.
-        ds = ds.cast_column(spec.audio_col or "audio", Audio(decode=False))
+        # Flip Audio.decode=False on the existing features. Do NOT cast_column to
+        # Audio(...) — that runs encode_example and imports torchcodec (datasets 4.x).
+        ds = _disable_media_decode(ds)
         # `written` (not just `have_n`) must be included here: a fresh stream restarts
         # from row 0, so it must also re-skip whatever THIS call already wrote in an
         # earlier attempt before the failure — otherwise a mid-stream restart duplicates
@@ -666,15 +748,13 @@ def fetch_source(
             del ds
             gc.collect()
             if "torchcodec" in str(e).lower():
-                # Not transient — retrying the identical call won't install a package.
-                # Surface the real fix immediately instead of burning 3 more retries
-                # first (each with its own wait) just to report the same thing later.
+                # Not transient, and installing torchcodec is the WRONG fix on this
+                # stack (torch 2.4.x + no matching FFmpeg). English already streams
+                # via soundfile; this means decode was still left on for this source.
                 raise SystemExit(
-                    f"{spec.hf_dataset}/{spec.hf_config}: `datasets` needs `torchcodec` "
-                    f"to decode audio and it isn't installed — run `pip install "
-                    f"torchcodec` (it pulls a build matched to your already-installed "
-                    f"`torch`), then re-run this exact command; it resumes from "
-                    f"{written} clip(s) already written this attempt. Original error: {e}"
+                    f"{spec.hf_dataset}/{spec.hf_config}: datasets still tried torchcodec "
+                    f"(do NOT pip install it — English already runs without it). "
+                    f"{written} clip(s) written this attempt are kept. Original error: {e}"
                 ) from last_err
             if looks_transient(e) and attempt < STREAM_RETRY_ATTEMPTS - 1:
                 wait = 2.0 * (attempt + 1)
