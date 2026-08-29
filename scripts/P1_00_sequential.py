@@ -99,11 +99,22 @@ def resolve_devices(args) -> list[str]:
 # --------------------------------------------------------------------------- #
 def stage_download(lang: str, cfg: Phase1CorpusConfig, args, out_dir: Path,
                    manifest_fh, already: dict, hf_token: str | None) -> None:
-    specs = cfg.sources.get(lang, [])
-    target_h = cfg.target_hours.get(lang, 0.0)
+    all_specs = cfg.sources.get(lang, [])
+    skip_ids = getattr(args, "skip_source_ids", None) or set()
+    specs = [s for s in all_specs if s.id not in skip_ids]
+    skipped = [s.id for s in all_specs if s.id in skip_ids]
+
+    lang_target_h = cfg.target_hours.get(lang, 0.0)
+    # Bar total reflects only the sources ACTUALLY being fetched this run, not the
+    # language's full target — otherwise a skipped source's share (e.g. fleurs' 40% of
+    # en's 150h) would permanently cap the bar around 60%, reading as unfinished when
+    # everything this run was actually asked to do is in fact done.
+    target_h = sum(lang_target_h * s.weight for s in specs)
     have_h = sum(already.get((lang, s.id), {}).get("hours", 0.0) for s in specs)
 
     print(f"\n[STAGE 1/4] DOWNLOAD  {lang}  (target {target_h:.0f}h across {len(specs)} source(s))")
+    if skipped:
+        print(f"  skipping this run (--skip-source): {skipped}")
     pbar = tqdm(total=round(target_h, 2), initial=round(min(have_h, target_h), 2),
                desc=f"download {lang}", unit="h", colour="cyan",
                bar_format="{l_bar}{bar}| {n:.1f}/{total:.1f}h [{elapsed}, {rate_fmt}]")
@@ -363,6 +374,12 @@ def main():
                     "start to finish, e.g. en / hi / gu — this script is strictly "
                     "sequential and single-language by design; run it again for the "
                     "next one")
+    ap.add_argument("--skip-source", default=None,
+                    help="comma-separated source id(s) to skip entirely this run, e.g. "
+                        "'fleurs' — useful to hold back a problematic source (still "
+                        "counted toward the language's total target hours, just not "
+                        "fetched) while running the rest of that language's sources "
+                        "normally; fetch the skipped one later with its own command/script")
     ap.add_argument("--out-dir", default="data/phase1_raw")
     ap.add_argument("--encoded-dir", default="data/encoded")
     ap.add_argument("--frames-out-dir", default="data/frames_phase1")
@@ -400,6 +417,8 @@ def main():
     if args.min_free_disk_gb is not None:
         cfg.min_free_disk_gb = args.min_free_disk_gb
     args.devices_list = resolve_devices(args)
+    args.skip_source_ids = {s.strip() for s in args.skip_source.split(",") if s.strip()} \
+        if args.skip_source else set()
 
     lang = args.lang
     if lang not in cfg.sources:
