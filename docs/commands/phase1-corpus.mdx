@@ -121,6 +121,31 @@ publishing it anywhere.
 
 Local-only, no upload: `python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml --no-upload`
 
+<Tip>
+**One language at a time, for better resource management** (recommended on a
+disk/bandwidth-constrained machine like Kaggle) — pass `--lang`. Each command still runs
+the full download → encode → upload → delete-old-wavs cycle **gradually as it goes** for
+just that one language, so at no point are all three languages' downloads competing for
+disk/network/CPU at once:
+```bash
+python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --min-free-disk-gb 8 --lang en
+
+python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --min-free-disk-gb 8 --lang hi
+
+python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --min-free-disk-gb 8 --lang gu
+```
+Run them one after another (wait for `en` to print "Phase-1 pipeline complete" before
+starting `hi`) — or as three separate Kaggle sessions if you want to split the 12-hour
+session limit across languages. Fully resumable and independent per language: stopping
+after `en` and coming back later for `hi`/`gu` costs nothing, and re-running the same
+`--lang` command again just continues where it left off (same manifest/DB as the
+all-languages-at-once run). `--lang en,hi` also works if you want exactly two of the
+three together.
+</Tip>
+
 **Cleaning up what's on Hugging Face** — deletes everything currently uploaded to
 `--hf-repo` (real content, listed from the repo itself) and clears the matching local
 `hf_sync` records, so a following run re-uploads cleanly instead of thinking it's all

@@ -603,6 +603,15 @@ def _run_cleanup(args) -> None:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/phase1_corpus.yaml")
+    ap.add_argument("--lang", default=None,
+                    help="only run this language (e.g. en / hi / gu), comma-separated "
+                        "for more than one (e.g. en,hi). Default: all languages in "
+                        "--config at once. Run one language at a time (three separate "
+                        "commands) instead of all together when disk/bandwidth is tight "
+                        "(e.g. Kaggle) — each command still downloads -> encodes -> "
+                        "uploads -> deletes-old-wavs gradually AS IT GOES for that one "
+                        "language, it's fully resumable, so `en` finishing before you "
+                        "start `hi` costs nothing extra.")
     ap.add_argument("--out-dir", default="data/phase1_raw")
     ap.add_argument("--encoded-dir", default="data/encoded")
     ap.add_argument("--frames-out-dir", default="data/frames_phase1")
@@ -675,10 +684,19 @@ def main():
 
     log = Logger()
     langs = list(cfg.sources.keys())
+    if args.lang:
+        wanted = {s.strip() for s in args.lang.split(",") if s.strip()}
+        unknown = wanted - set(langs)
+        if unknown:
+            raise SystemExit(f"--lang {sorted(unknown)} not in {args.config}'s languages "
+                             f"({langs})")
+        langs = [l for l in langs if l in wanted]
     jobs = [(lang, spec) for lang in langs for spec in cfg.sources.get(lang, [])]
 
     print("=" * 72)
     print("ThinkSpark-v2-350M — Phase-1 pipeline (download -> encode -> frames -> upload)")
+    if args.lang:
+        print(f"(--lang filter active: only {langs} this run)")
     print("=" * 72)
     for lang in langs:
         print(f"[{lang}] target={cfg.target_hours.get(lang, 0.0):.0f}h  "
