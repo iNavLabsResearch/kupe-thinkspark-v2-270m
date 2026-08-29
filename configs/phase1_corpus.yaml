@@ -45,7 +45,12 @@ sources:
     - id: librispeech
       hf_dataset: openslr/librispeech_asr
       hf_config: clean
-      split: train.clean.360       # ~360h nominal (104k rows) — plenty for a 0.60 weight slice
+      split: train.360             # ~360h nominal (104k rows) — plenty for a 0.60 weight slice.
+                                    # NOT "train.clean.360" — the "clean" config's own splits are
+                                    # named train.100/train.360/test/validation (no "clean." prefix
+                                    # inside the split name itself; verified against the real error
+                                    # HF returns: "Available splits: ['test', 'train.100',
+                                    # 'train.360', 'validation']").
       gated: false                 # public, ungated, verified live and streamable
       weight: 0.60                 # replaces the now-dead common_voice slice (see file header)
       note: "~1000h public-domain read-speech audiobooks (LibriSpeech); no gender field — falls back to unlabeled, fine, gender_balance just skips it for this source"
