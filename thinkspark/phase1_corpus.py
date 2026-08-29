@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -220,10 +221,17 @@ def fetch_source(
     hf_token: str | None,
     dry_run: bool,
     log_fn: Callable[[str], None] = print,
+    progress_fn: Callable[[float], None] | None = None,
 ) -> dict:
     """
     Stream one source, writing wavs + manifest rows until this source's share of
     target_hours is reached (or the stream runs out). Returns a small result summary.
+
+    `progress_fn`, if given, is called with the INCREMENTAL hours (not running total)
+    added by each clip as it's written — lets a caller (scripts/P1_00_pipeline.py) show
+    live progress instead of only learning the total once this whole source finishes,
+    which for a big source (e.g. 90h) could otherwise look like nothing is happening
+    for a long time even while clips are actively streaming in.
 
     `manifest_fh` must be safe to call `.write()`/`.flush()` on from whatever thread
     calls this (the CLI passes a plain file handle from a single-threaded run;
@@ -373,7 +381,23 @@ def fetch_source(
 
                     cid = clip_id(lang, spec.id, row_index)
                     wav_path = lang_dir / f"{spec.id}_{cid}.wav"
-                    sf.write(str(wav_path), arr, sr)
+                    # Write to a temp name in the SAME directory, then atomically rename
+                    # into place (os.replace is atomic on the same filesystem). Matters
+                    # once anything else can be reading this directory concurrently
+                    # while downloads are still writing to it — scripts/P1_00_pipeline.py's
+                    # periodic encode sweep now does exactly that, so a plain sf.write()
+                    # straight to wav_path could let the encoder glob/open a file that's
+                    # only partially flushed. A reader only ever sees "doesn't exist yet"
+                    # or "fully written", never a partial file, this way.
+                    # NOTE: the temp name must still end in ".wav" — soundfile.write()
+                    # infers the output format from the file extension by default, so a
+                    # suffix like ".tmp12345" (no trailing ".wav") makes it raise "No
+                    # format specified". Passing format="WAV" explicitly removes that
+                    # extension-guessing dependency entirely (belt-and-suspenders: this
+                    # bug is exactly why the explicit format arg is worth the one word).
+                    tmp_path = wav_path.with_name(f"{wav_path.stem}.tmp{os.getpid()}.wav")
+                    sf.write(str(tmp_path), arr, sr, format="WAV")
+                    os.replace(str(tmp_path), str(wav_path))
                 except Exception as e:
                     # one corrupted row (same class of transient glitch as a dead stream,
                     # just caught at the single-row level) — skip it, keep going, don't
@@ -393,6 +417,8 @@ def fetch_source(
 
                 written += 1
                 have_h += duration_s / 3600.0
+                if progress_fn:
+                    progress_fn(duration_s / 3600.0)
                 if have_h >= target_h:
                     break
 

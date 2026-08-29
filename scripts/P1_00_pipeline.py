@@ -169,6 +169,29 @@ def status_summary_loop(status: PipelineStatus, log: Logger, stop_event: threadi
            f"queues[encode={s['encode_queue_depth']} upload={s['upload_queue_depth']}]")
 
 
+def periodic_encode_sweep(encode_q: "queue.Queue[str | None]", langs: list[str],
+                          interval_s: float, sweep_stop_event: threading.Event, log: Logger) -> None:
+    """
+    Enqueues every language onto the encode queue on a fixed timer, REGARDLESS of
+    whether any individual source or language has actually finished downloading yet.
+
+    Why this exists: encoding used to only get triggered once ALL of a language's
+    sources finished — fine when sources are small, but a single big source (e.g.
+    LibriSpeech's 90h English slice) can download for a long time before that ever
+    happens, during which raw wav accumulates completely unbounded (no cleanup — see
+    `encode_and_build_frames`'s wav-delete-after-encode) with nothing to stop it. This
+    sweep decouples encoding from any completion event entirely: every `interval_s`,
+    whatever's downloaded so far — even mid-source, even the very first clip — gets
+    encoded and its wav freed, so disk usage stays bounded by "how much downloads in
+    one interval" instead of "the single biggest source's entire target". Enqueuing an
+    already-fully-encoded language is a cheap no-op (`encode_and_build_frames` skips
+    wavs that already have a matching .npz), so over-sweeping costs almost nothing.
+    """
+    while not sweep_stop_event.wait(interval_s):
+        for lang in langs:
+            encode_q.put(lang)
+
+
 # --------------------------------------------------------------------------- #
 # DOWNLOAD stage
 # --------------------------------------------------------------------------- #
@@ -176,14 +199,24 @@ def download_worker(cfg, lang, spec, out_dir, manifest_w, already, hf_token, log
     tag = f"{lang}/{spec.id}"
     log("DOWNLOAD", tag, f"starting -> {spec.hf_dataset}/{spec.hf_config or spec.split} "
        f"(weight={spec.weight:.2f})")
+
+    # Credit whatever's already on disk from a PRIOR run immediately, then stream live
+    # progress via progress_fn as NEW clips are written this run — otherwise a big
+    # source (e.g. 90h) shows 0.0h in the [STATUS] line the whole time it's actively
+    # downloading, only updating once the entire source finishes, which reads as
+    # "stuck" even though it never was.
+    baseline_h = already.get((lang, spec.id), {}).get("hours", 0.0)
+    if baseline_h:
+        status.add_download_hours(lang, baseline_h)
+
     r = fetch_source(cfg, lang, spec, out_dir, ROOT, manifest_w, already, hf_token, False,
-                     log_fn=lambda m: log("DOWNLOAD", tag, m))
+                     log_fn=lambda m: log("DOWNLOAD", tag, m),
+                     progress_fn=lambda h: status.add_download_hours(lang, h))
     if r["status"] == "already_done":
         log("DOWNLOAD", tag, f"already done: {r['have_hours']:.2f}h >= {r['target_hours']:.2f}h target")
     else:
         log("DOWNLOAD", tag, f"done: wrote {r.get('written', 0)} clips -> "
            f"{r['have_hours']:.2f}h (target {r['target_hours']:.2f}h)")
-    status.add_download_hours(lang, r["have_hours"])
     return lang, spec.id, r
 
 
@@ -207,6 +240,7 @@ def encode_and_build_frames(lang: str, cfg, args, log, status) -> int:
 
     wavs = sorted(wav_dir.glob("*.wav"))
     new_count = 0
+    deleted_count = 0
     for wav in wavs:
         out_path = encoded_dir / f"{wav.stem}.npz"
         if out_path.exists():
@@ -218,8 +252,45 @@ def encode_and_build_frames(lang: str, cfg, args, log, status) -> int:
             status.npz_encoded_total += 1
             if new_count % 25 == 0:
                 log("ENCODE", lang, f"...{new_count} new clips encoded so far")
+            # Raw wav is only needed to PRODUCE the .npz — once that's saved (and
+            # verified non-empty), keep the .npz (the actual training input) and delete
+            # the wav. This is what stops disk from filling: at ~48 KB/s of raw 24kHz
+            # audio, a full multi-hundred-hour target needs tens of GB of raw wav that
+            # nothing downstream ever reads again once encoded. `--keep-raw-audio` opts
+            # out if you want the raw wavs kept for some other reason.
+            if not getattr(args, "keep_raw_audio", False):
+                try:
+                    import numpy as np
+                    if len(np.load(out_path)["cb0"]) > 0:
+                        wav.unlink()
+                        deleted_count += 1
+                    else:
+                        log("ENCODE", lang, f"! {wav.name} encoded to 0 frames — keeping wav for inspection")
+                except Exception as ve:
+                    log("ENCODE", lang, f"! couldn't verify {out_path.name}, keeping its wav: {ve}")
         except Exception as e:
             log("ENCODE", lang, f"! failed {wav.name}: {e}")
+
+        # Explicitly yield the GIL after every clip. Real, confirmed issue (not
+        # theoretical): a continuous run of torch/numpy C-extension calls back-to-back
+        # can hold the GIL for the vast majority of wall-clock time even though each
+        # individual call is short — CPython's normal bytecode-level GIL check happens
+        # BETWEEN Python instructions, not mid-C-call, so a tight loop dominated by C
+        # extension work can nearly starve other threads of GIL time entirely (a
+        # well-documented CPython "convoy effect": a CPU-bound thread that's always
+        # immediately ready to run tends to keep winning the GIL against I/O-bound
+        # threads that only intermittently become ready). Measured on this exact
+        # pipeline: download threads made ZERO progress for 10+ minutes while this loop
+        # ran continuously, confirmed via `ps -M` showing one thread pinned at ~85% CPU
+        # and all download threads at ~0%. `time.sleep()` unconditionally releases the
+        # GIL for its duration, giving the download threads a guaranteed window every
+        # single clip — a small, deliberate cost (default 30ms/clip) worth paying so
+        # downloading and encoding actually run concurrently instead of one starving
+        # the other on a single machine.
+        time.sleep(args.encode_yield_ms / 1000.0)
+
+    if deleted_count:
+        log("ENCODE", lang, f"freed disk: deleted {deleted_count} raw wav(s) now that they're encoded")
 
     log("ENCODE", lang, f"encoding done: {new_count} new / {len(wavs)} total wavs -> {encoded_dir}")
 
@@ -352,6 +423,16 @@ def _upload_language(api, args, db: RunDB, lang: str, log, status, CommitOperati
             npz_path = ROOT / rec["encoded_path"]
             if npz_path.exists():
                 to_upload.append((cid, npz_path))
+
+    if not to_upload:
+        # Nothing new since last upload for this language — with the periodic encode
+        # sweep (encoding + this function both get invoked repeatedly, independent of
+        # any source/language actually finishing), this is the common case most passes.
+        # Skip entirely rather than re-uploading an unchanged frames_<lang>.jsonl on
+        # every sweep, which would otherwise spam the repo with a commit every
+        # `--encode-sweep-interval` seconds for the whole run even when idle.
+        log("UPLOAD", lang, "nothing new since last upload, skipping")
+        return
 
     log("UPLOAD", lang, f"{len(to_upload)} new .npz to upload, plus frames_{lang}.jsonl")
 
@@ -530,6 +611,24 @@ def main():
     ap.add_argument("--download-concurrency", type=int, default=3,
                     help="concurrent (language, source) download workers (default 3)")
     ap.add_argument("--device", default=None, help="Mimi encoder device override (cpu/cuda/mps)")
+    ap.add_argument("--keep-raw-audio", action="store_true",
+                    help="don't delete a wav after encoding it (default: delete once its "
+                        ".npz is verified — a full target's raw audio alone can be tens "
+                        "of GB that nothing downstream ever reads again)")
+    ap.add_argument("--encode-yield-ms", type=float, default=30.0,
+                    help="milliseconds to sleep (explicitly releasing the GIL) after "
+                        "EVERY encoded clip (default 30) — without this, continuous "
+                        "back-to-back torch/numpy encoding can nearly starve the "
+                        "download threads of CPU/GIL time entirely (measured: zero "
+                        "download progress for 10+ minutes on this exact pipeline). "
+                        "Set to 0 to disable if you ever run with a single download "
+                        "source (nothing to starve) and want maximum encode throughput.")
+    ap.add_argument("--encode-sweep-interval", type=float, default=90.0,
+                    help="seconds between periodic encode passes over whatever's "
+                        "downloaded SO FAR, independent of any source/language finishing "
+                        "(default 90) — without this, disk usage tracks whichever source "
+                        "has the BIGGEST target, not the smallest, since encoding used to "
+                        "only start once an entire language's full download finished")
     ap.add_argument("--files-per-commit", type=int, default=200,
                     help="max .npz files packed into one HF commit (default 200)")
     ap.add_argument("--sleep", type=float, default=2.0)
@@ -606,6 +705,15 @@ def main():
         target=upload_worker_loop, args=(upload_q, args, db, log, status, stop_event), daemon=True)
     upload_thread.start()
 
+    # Encode+free-disk on a timer too, not just when a whole language's downloads
+    # finish — see periodic_encode_sweep's docstring for why this matters (disk usage
+    # would otherwise track the single BIGGEST source's entire target).
+    sweep_stop_event = threading.Event()
+    sweep_thread = threading.Thread(
+        target=periodic_encode_sweep,
+        args=(encode_q, langs, args.encode_sweep_interval, sweep_stop_event, log), daemon=True)
+    sweep_thread.start()
+
     # DOWNLOAD: bounded thread pool, one task per (lang, source). As each (lang, source)
     # completes, check if that language's ENTIRE source set is now done -> enqueue it.
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -639,6 +747,7 @@ def main():
     finally:
         manifest_fh.close()
 
+    sweep_stop_event.set()   # stop the periodic sweep — the sentinel below guarantees one final pass
     log("MAIN", "-", "all downloads finished — waiting for encode/upload to drain...")
     encode_q.put(None)   # sentinel: no more languages, propagates to upload_q when encode drains
     encode_thread.join()

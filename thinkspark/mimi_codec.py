@@ -64,12 +64,24 @@ class MimiEncoder:
     def _ensure_loaded(self):
         if self._model is not None:
             return
+        import os
+
         import torch
         from transformers import MimiModel, AutoFeatureExtractor
 
         self._torch = torch
         dev = self._device or ("cuda" if torch.cuda.is_available() else "cpu")
         self._device = dev
+        if dev == "cpu":
+            # By default torch uses ALL CPU cores for its own internal intra-op thread
+            # pool. If something else in the same process ALSO does CPU-bound torch work
+            # concurrently (e.g. scripts/P1_00_pipeline.py's download threads decoding
+            # audio via torchcodec, which is torch-based too), that other work can get
+            # starved of real CPU cycles by this model's inference alone, independent of
+            # — and in addition to — ordinary Python GIL contention. Cap it at half the
+            # cores so there's real headroom left for concurrent torch work elsewhere in
+            # the same process; encoding a single short clip doesn't need every core.
+            torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2))
         self._model = MimiModel.from_pretrained(self.repo).to(dev).eval()
         self._fe = AutoFeatureExtractor.from_pretrained(self.repo)
         # codebook size from config (used to size the model's audio embedding table)
