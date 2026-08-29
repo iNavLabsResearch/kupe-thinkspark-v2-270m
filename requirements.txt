@@ -22,17 +22,18 @@ soundfile>=0.12            # robust wav io (optional; stdlib wave is the fallbac
 
 # ---- Phase-1 corpus fetch (scripts/P1_01_fetch_corpus.py) -------------------
 datasets>=2.19             # streams Common Voice / Kathbath / Shrutilipi / FLEURS / IndicTTS
-# REQUIRED as of `datasets` 4.x/5.x — real observed failure without it: streaming an
-# Audio-cast column raises "To support decoding audio data, please install 'torchcodec'."
-# immediately on the first row (not a warning, a hard stop).
-# PIN to <0.11 — real observed bug, confirmed upstream: torchcodec 0.11.0+ unconditionally
-# requires CUDA 13's libnvrtc.so.13 to even IMPORT, regardless of whether GPU decoding is
-# ever used (https://github.com/ace-step/ACE-Step-1.5/issues/1078) — fails immediately on
-# any box whose actual CUDA runtime is a different major version (very common — e.g. a
-# RunPod GPU pod on CUDA 12.x), with a `libnvrtc.so.13: cannot open shared object file`
-# error. This project only ever needs CPU-side decode of small audio clips — no GPU
-# acceleration benefit either way — so there's no reason to eat that requirement.
-torchcodec>=0.1,<0.11
+# NO torchcodec dependency, deliberately — this project fetches Audio-cast columns with
+# `Audio(decode=False)` and decodes the raw bytes itself via plain `soundfile` (already a
+# dependency above), instead of using `datasets`' built-in decode path. Real, repeated
+# breakage this avoids: `datasets` 4.x/5.x hard-requires torchcodec for its own decode
+# path, but torchcodec categorically doesn't support torch<2.5 (no torchcodec version
+# fixes that — confirmed against its own compatibility table, hit on a real box running
+# torch 2.4.1), and separately hit CUDA-version-specific `libnvrtc`/`libavutil` shared-
+# library failures even when a nominally-compatible version WAS installed (torchcodec
+# 0.11+ hard-requires CUDA 13's libnvrtc regardless of GPU usage; older versions need
+# system FFmpeg's exact matching .so version). None of that is needed for this project's
+# actual use — decoding small audio clips, which `soundfile` already does reliably with
+# zero torch/CUDA coupling.
 
 # ---- data generation --------------------------------------------------------
 openai>=1.40               # scenario + label writer + LLM-judge (any OpenAI-compatible endpoint)

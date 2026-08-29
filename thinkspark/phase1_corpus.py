@@ -150,12 +150,22 @@ def relative_or_absolute(path: Path, root: Path) -> str:
 
 
 def _is_audio_value(v) -> bool:
-    """True for either shape `datasets` hands back for an Audio-cast column: the older
-    dict `{"array": ..., "sampling_rate": ...}` (soundfile-based decode), or a
-    torchcodec `AudioDecoder` object (current `datasets` default — duck-typed via
-    `get_all_samples`, since isinstance-checking a lazily-imported torchcodec class
-    would force-import torchcodec even for sources that don't need it)."""
+    """True for any shape `datasets` hands back for an Audio-cast column: the older
+    dict `{"array": ..., "sampling_rate": ...}` (soundfile-based decode), a torchcodec
+    `AudioDecoder` object (duck-typed via `get_all_samples`, since isinstance-checking a
+    lazily-imported torchcodec class would force-import torchcodec even for sources that
+    don't need it), or the RAW (undecoded) `{"bytes": ..., "path": ...}` shape this
+    project now requests via `Audio(decode=False)` — see `fetch_source`'s cast_column
+    call for why: `datasets`' own decoding (both the old soundfile path and the new
+    torchcodec path) turned out to be a real, repeated source of environment breakage
+    (torchcodec categorically doesn't support torch<2.5, hit on a real RunPod image
+    running torch 2.4.1 — no torchcodec version fixes that, confirmed against
+    torchcodec's own compatibility table). Decoding the raw bytes ourselves with plain
+    `soundfile` — a dependency this project already has everywhere, zero torch/CUDA
+    coupling — sidesteps that whole class of bug permanently."""
     if isinstance(v, dict) and "array" in v and "sampling_rate" in v:
+        return True
+    if isinstance(v, dict) and "bytes" in v and "path" in v:
         return True
     return hasattr(v, "get_all_samples")
 
@@ -169,18 +179,33 @@ def detect_audio_column(row: dict) -> str | None:
 
 def extract_waveform(audio_value) -> tuple:
     """
-    Returns (numpy_array, sample_rate) for either shape `_is_audio_value` accepts.
+    Returns (numpy_array, sample_rate) for any shape `_is_audio_value` accepts.
     Verified against torchcodec's real, documented API (meta-pytorch.org/torchcodec —
-    NOT guessed): `AudioDecoder.get_all_samples()` -> `AudioSamples`, whose `.data` is a
-    `torch.Tensor` shaped (num_channels, num_samples) in [-1, 1], and `.sample_rate` is
-    an int. soundfile wants (num_samples,) for mono or (num_samples, num_channels) for
-    multi-channel, so channel-first torch layout is transposed/squeezed accordingly.
-    Returns (None, None) if `audio_value` doesn't match either known shape.
+    NOT guessed) for the AudioDecoder shape: `AudioDecoder.get_all_samples()` ->
+    `AudioSamples`, whose `.data` is a `torch.Tensor` shaped (num_channels, num_samples)
+    in [-1, 1], and `.sample_rate` is an int. soundfile wants (num_samples,) for mono or
+    (num_samples, num_channels) for multi-channel, so channel-first torch layout is
+    transposed/squeezed accordingly. Returns (None, None) if `audio_value` doesn't match
+    any known shape.
     """
     import numpy as np
 
     if isinstance(audio_value, dict) and "array" in audio_value and "sampling_rate" in audio_value:
         return np.asarray(audio_value["array"], dtype=np.float32), int(audio_value["sampling_rate"])
+    if isinstance(audio_value, dict) and "bytes" in audio_value and "path" in audio_value:
+        import io
+
+        import soundfile as sf
+
+        raw = audio_value.get("bytes")
+        if raw is not None:
+            arr, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+        else:
+            path = audio_value.get("path")
+            if not path:
+                return None, None
+            arr, sr = sf.read(path, dtype="float32", always_2d=False)
+        return np.asarray(arr, dtype=np.float32), int(sr)
     if hasattr(audio_value, "get_all_samples"):
         samples = audio_value.get_all_samples()
         arr = samples.data.numpy()
@@ -482,7 +507,19 @@ def fetch_source(
                 continue
             raise SystemExit(f"failed to open {spec.hf_dataset}/{spec.hf_config}: {e}")
 
-        ds = ds.cast_column(spec.audio_col or "audio", Audio(sampling_rate=cfg.sample_rate))
+        # `decode=False`: get the RAW (undecoded) bytes instead of letting `datasets`
+        # decode the audio itself. Real, repeated breakage avoided by this: `datasets`'
+        # decode path now requires `torchcodec`, which categorically doesn't support
+        # torch<2.5 (no version fixes that — confirmed against its own compatibility
+        # table, hit on a real box running torch 2.4.1) and separately hit CUDA-version-
+        # specific `libnvrtc`/`libavutil` shared-library failures even when a compatible
+        # version WAS installed. `extract_waveform()` decodes the raw bytes itself via
+        # plain `soundfile` instead — a dependency this project already uses everywhere,
+        # with zero torch/CUDA/FFmpeg-version coupling. No `sampling_rate=` resample
+        # here either: MimiEncoder.encode_waveform already resamples to its own 24kHz
+        # operating rate internally, so requesting one here would be redundant work for
+        # no benefit.
+        ds = ds.cast_column(spec.audio_col or "audio", Audio(decode=False))
         # `written` (not just `have_n`) must be included here: a fresh stream restarts
         # from row 0, so it must also re-skip whatever THIS call already wrote in an
         # earlier attempt before the failure — otherwise a mid-stream restart duplicates
