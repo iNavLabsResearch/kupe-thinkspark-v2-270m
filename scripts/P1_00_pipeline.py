@@ -172,6 +172,7 @@ class PipelineStatus:
         self.lang_deleted: dict[str, int] = {lang: 0 for lang in langs}
         self.upload_queue_depth = 0
         self.encode_queue_depth = 0
+        self.upload_disabled_reason: str | None = None
         self.done = False
 
     def add_download_hours(self, lang: str, hours: float) -> None:
@@ -209,6 +210,7 @@ class PipelineStatus:
                 "lang_deleted": dict(self.lang_deleted),
                 "encode_queue_depth": self.encode_queue_depth,
                 "upload_queue_depth": self.upload_queue_depth,
+                "upload_disabled_reason": self.upload_disabled_reason,
             }
 
 
@@ -252,9 +254,14 @@ def _render_dashboard(status: PipelineStatus, hf_repo: str | None) -> "Table":
         f"[bold green]{s['npz_uploaded_total']}[/bold green]",
         f"[bold red]{s['deleted_wavs_total']}[/bold red]",
     )
-    table.caption = (f"queues: encode={s['encode_queue_depth']} upload={s['upload_queue_depth']}   "
-                    f"encoded_langs={sorted(s['lang_encoded']) or '-'}   "
-                    f"uploaded_langs={sorted(s['lang_uploaded_frames']) or '-'}")
+    caption = (f"queues: encode={s['encode_queue_depth']} upload={s['upload_queue_depth']}   "
+              f"encoded_langs={sorted(s['lang_encoded']) or '-'}   "
+              f"uploaded_langs={sorted(s['lang_uploaded_frames']) or '-'}")
+    if s["upload_disabled_reason"]:
+        # Impossible to miss: red, on every single redraw of the pinned table, not just
+        # a one-time log line that scrolls away in a long Kaggle run.
+        caption += f"\n[bold red]⚠ UPLOADS DISABLED: {s['upload_disabled_reason']}[/bold red]"
+    table.caption = caption
     return table
 
 
@@ -275,6 +282,8 @@ def status_summary_loop(status: PipelineStatus, log: Logger, stop_event: threadi
                f"npz_encoded={s['npz_encoded_total']}  npz_uploaded={s['npz_uploaded_total']}  "
                f"deleted={s['deleted_wavs_total']}  "
                f"queues[encode={s['encode_queue_depth']} upload={s['upload_queue_depth']}]")
+            if s["upload_disabled_reason"]:
+                log("STATUS", "overall", f"! UPLOADS DISABLED: {s['upload_disabled_reason']}")
         return
 
     # Rich path: a small Live table pinned at the bottom of the terminal, redrawn every
@@ -340,28 +349,53 @@ def download_worker(cfg, lang, spec, out_dir, manifest_w, already, hf_token, log
 
 
 # --------------------------------------------------------------------------- #
-# ENCODE + FRAMES stage — single worker, one shared Mimi model instance
+# ENCODE + FRAMES stage — one Mimi encoder instance PER DEVICE, reused across calls
+# (not reloaded every sweep), so `--devices cuda:0,cuda:1` genuinely uses both GPUs.
 # --------------------------------------------------------------------------- #
-def encode_and_build_frames(lang: str, cfg, args, log, status) -> int:
-    """Encodes any not-yet-encoded wavs for `lang`, then rebuilds its frames_<lang>.jsonl
-    from the manifest. Returns the number of NEWLY encoded clips (for upload targeting)."""
-    from thinkspark.mimi_codec import MimiEncoder
+_encoders: dict[str, "object"] = {}   # device string -> MimiEncoder, lazily created once
+_encoders_lock = threading.Lock()
 
-    global _encoder
-    if _encoder is None:
-        log("ENCODE", lang, f"loading Mimi encoder ({cfg.mimi_repo if hasattr(cfg, 'mimi_repo') else 'kyutai/mimi'})...")
-        _encoder = MimiEncoder(repo=getattr(cfg, "mimi_repo", "kyutai/mimi"), device=args.device)
-        cb_size = _encoder.codebook_size   # triggers _ensure_loaded(), so _device is set below
-        # Visibility for "GPU shows 0% util despite active encoding" reports: confirms
-        # which device the encoder actually loaded on, rather than guessing from
-        # external monitors whose sampling interval can miss short per-clip GPU bursts.
-        log("ENCODE", lang, f"Mimi encoder ready (device={_encoder._device}, codebook_size={cb_size})")
 
-    wav_dir = ROOT / args.out_dir / lang
-    encoded_dir = ROOT / args.encoded_dir
-    encoded_dir.mkdir(parents=True, exist_ok=True)
+def resolve_devices(args) -> list[str]:
+    """--devices explicit list > --device single override > auto-detect ALL visible
+    CUDA devices (so `--num-gpu 2` isn't even needed, both T4s are used automatically)
+    > cpu. Resolved ONCE in main() and reused for the whole run — avoids re-probing
+    torch.cuda on every encode sweep."""
+    if getattr(args, "devices", None):
+        return [d.strip() for d in args.devices.split(",") if d.strip()]
+    if args.device:
+        return [args.device]
+    try:
+        import torch
+        n = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:
+        n = 0
+    if n > 0:
+        return [f"cuda:{i}" for i in range(n)]
+    return ["cpu"]
 
-    wavs = sorted(wav_dir.glob("*.wav"))
+
+def _get_encoder(device: str, cfg, log):
+    """One MimiEncoder per device, created once and cached — NOT reloaded on every
+    encode sweep, and never shared across two threads at once (callers only ever
+    dispatch one shard per device concurrently, see encode_and_build_frames)."""
+    with _encoders_lock:
+        enc = _encoders.get(device)
+        if enc is None:
+            from thinkspark.mimi_codec import MimiEncoder
+            log("ENCODE", device, f"loading Mimi encoder on {device} "
+               f"({getattr(cfg, 'mimi_repo', 'kyutai/mimi')})...")
+            enc = MimiEncoder(repo=getattr(cfg, "mimi_repo", "kyutai/mimi"), device=device)
+            cb_size = enc.codebook_size   # triggers _ensure_loaded()
+            log("ENCODE", device, f"Mimi encoder ready (device={enc._device}, codebook_size={cb_size})")
+            _encoders[device] = enc
+        return enc
+
+
+def _encode_shard(wavs: list[Path], device: str, encoded_dir: Path, cfg, args, log,
+                  status, lang: str) -> tuple[int, int]:
+    """Encode one shard of `wavs` on `device`. Returns (new_count, deleted_count)."""
+    encoder = _get_encoder(device, cfg, log)
     new_count = 0
     deleted_count = 0
     for wav in wavs:
@@ -369,12 +403,12 @@ def encode_and_build_frames(lang: str, cfg, args, log, status) -> int:
         if out_path.exists():
             continue
         try:
-            enc = _encoder.encode_wav_file(str(wav))
+            enc = encoder.encode_wav_file(str(wav))
             enc.save(out_path)
             new_count += 1
             status.add_encoded(lang)
             if new_count % 25 == 0:
-                log("ENCODE", lang, f"...{new_count} new clips encoded so far")
+                log("ENCODE", f"{lang}@{device}", f"...{new_count} new clips encoded so far")
             # Raw wav is only needed to PRODUCE the .npz — once that's saved (and
             # verified non-empty), keep the .npz (the actual training input) and delete
             # the wav. This is what stops disk from filling: at ~48 KB/s of raw 24kHz
@@ -389,11 +423,11 @@ def encode_and_build_frames(lang: str, cfg, args, log, status) -> int:
                         deleted_count += 1
                         status.add_deleted(lang)
                     else:
-                        log("ENCODE", lang, f"! {wav.name} encoded to 0 frames — keeping wav for inspection")
+                        log("ENCODE", f"{lang}@{device}", f"! {wav.name} encoded to 0 frames — keeping wav for inspection")
                 except Exception as ve:
-                    log("ENCODE", lang, f"! couldn't verify {out_path.name}, keeping its wav: {ve}")
+                    log("ENCODE", f"{lang}@{device}", f"! couldn't verify {out_path.name}, keeping its wav: {ve}")
         except Exception as e:
-            log("ENCODE", lang, f"! failed {wav.name}: {e}")
+            log("ENCODE", f"{lang}@{device}", f"! failed {wav.name}: {e}")
 
         # Explicitly yield the GIL after every clip. Real, confirmed issue (not
         # theoretical): a continuous run of torch/numpy C-extension calls back-to-back
@@ -413,10 +447,47 @@ def encode_and_build_frames(lang: str, cfg, args, log, status) -> int:
         # the other on a single machine.
         time.sleep(args.encode_yield_ms / 1000.0)
 
+    return new_count, deleted_count
+
+
+def encode_and_build_frames(lang: str, cfg, args, log, status) -> int:
+    """Encodes any not-yet-encoded wavs for `lang` — split across ALL of `args.devices_list`
+    in parallel when there's more than one (e.g. `--devices cuda:0,cuda:1` uses both of
+    Kaggle's T4s at once instead of one sitting idle) — then rebuilds its
+    frames_<lang>.jsonl from the manifest. Returns the number of NEWLY encoded clips."""
+    wav_dir = ROOT / args.out_dir / lang
+    encoded_dir = ROOT / args.encoded_dir
+    encoded_dir.mkdir(parents=True, exist_ok=True)
+
+    all_wavs = sorted(wav_dir.glob("*.wav"))
+    pending = [w for w in all_wavs if not (encoded_dir / f"{w.stem}.npz").exists()]
+
+    devices = getattr(args, "devices_list", None) or ["cpu"]
+    new_count = deleted_count = 0
+    if pending:
+        if len(devices) == 1 or len(pending) == 1:
+            new_count, deleted_count = _encode_shard(pending, devices[0], encoded_dir, cfg, args, log, status, lang)
+        else:
+            # Round-robin split (not contiguous chunks) so every device gets a similar mix
+            # of clip sizes instead of one device getting a run of unusually long/short
+            # clips back-to-back purely by file-sort-order luck.
+            shards = {d: pending[i::len(devices)] for i, d in enumerate(devices)}
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=len(devices)) as pool:
+                futs = {
+                    pool.submit(_encode_shard, shard, d, encoded_dir, cfg, args, log, status, lang): d
+                    for d, shard in shards.items() if shard
+                }
+                for fut in as_completed(futs):
+                    n, d_ = fut.result()
+                    new_count += n
+                    deleted_count += d_
+
     if deleted_count:
         log("ENCODE", lang, f"freed disk: deleted {deleted_count} raw wav(s) now that they're encoded")
 
-    log("ENCODE", lang, f"encoding done: {new_count} new / {len(wavs)} total wavs -> {encoded_dir}")
+    log("ENCODE", lang, f"encoding done: {new_count} new / {len(all_wavs)} total wavs "
+       f"-> {encoded_dir} (devices={devices})")
 
     # BUILD FRAMES — reads the whole manifest, filters to this language (cheap: manifest
     # rows are small JSON lines; re-filtering per language on every rebuild is simpler
@@ -448,9 +519,6 @@ def encode_and_build_frames(lang: str, cfg, args, log, status) -> int:
     return new_count
 
 
-_encoder = None   # shared MimiEncoder instance, lazily loaded once by the encode worker
-
-
 def encode_worker_loop(encode_q: "queue.Queue[str | None]", upload_q: "queue.Queue[str | None]",
                        cfg, args, log, status, stop_event: threading.Event) -> None:
     while True:
@@ -480,23 +548,60 @@ def encode_worker_loop(encode_q: "queue.Queue[str | None]", upload_q: "queue.Que
 def upload_worker_loop(upload_q: "queue.Queue[str | None]", args, db: RunDB, log,
                        status, stop_event: threading.Event) -> None:
     if args.no_upload:
-        return
-    try:
-        from huggingface_hub import CommitOperationAdd, HfApi
-    except ImportError:
-        log("UPLOAD", "-", "huggingface_hub not installed — `pip install huggingface_hub`. "
-           "Uploads disabled for this run; local data is still complete.")
+        status.upload_disabled_reason = "disabled via --no-upload"
         return
 
-    token = env("HF_TOKEN", required=True)
-    api = HfApi(token=token)
+    # REAL BUG THIS GUARDS AGAINST: `env("HF_TOKEN", required=True)` used to be called
+    # bare here — if HF_TOKEN was missing, it raised RuntimeError with NOTHING catching
+    # it, which silently killed this whole thread the instant the run started. Python
+    # doesn't crash the process or print through our tagged Logger when a background
+    # thread dies uncaught — it just vanishes, so "Uploaded" stayed frozen at 0 for the
+    # ENTIRE run with no visible reason (confirmed: this is exactly what happened on a
+    # real Kaggle run — `!export HF_TOKEN=...` in one notebook cell does NOT persist into
+    # a later `!python ...` cell's subprocess environment; each `!` cell is its own shell).
+    # Now every failure mode is caught, logged LOUDLY and repeatedly through the same
+    # Logger everything else uses (so it can't scroll past unnoticed in a long Kaggle
+    # log), and surfaced on the live dashboard too — never silent again.
+    setup_error: str | None = None
+    api = None
     try:
-        ensure_repo(api, args.hf_repo, args.private)
-    except RuntimeError as e:
-        log("UPLOAD", "-", f"! {e}")
-        log("UPLOAD", "-", "uploads disabled for this run — local data is still being "
-           "produced normally, fix the repo/token and re-run to upload what's pending.")
+        from huggingface_hub import CommitOperationAdd, HfApi
+    except ImportError as e:
+        setup_error = f"huggingface_hub not installed — `pip install huggingface_hub` ({e})"
+
+    if setup_error is None:
+        try:
+            token = env("HF_TOKEN", required=True)
+        except Exception as e:
+            setup_error = (
+                f"HF_TOKEN not set in this process's environment ({e}). If you're on "
+                f"Kaggle/Jupyter: `!export HF_TOKEN=...` in one cell does NOT persist to "
+                f"a later `!python ...` cell — each `!` line runs in its own throwaway "
+                f"shell. Set it BEFORE launching this script instead, in the SAME cell "
+                f"or process: `import os; os.environ['HF_TOKEN'] = '...'` (or a Kaggle "
+                f"Secret loaded the same way), then re-run."
+            )
+        else:
+            api = HfApi(token=token)
+            try:
+                ensure_repo(api, args.hf_repo, args.private)
+            except RuntimeError as e:
+                setup_error = str(e)
+            except Exception as e:
+                setup_error = f"unexpected error reaching HF: {e}"
+
+    if setup_error:
+        status.upload_disabled_reason = setup_error
+        log("UPLOAD", "-", f"! UPLOADS DISABLED FOR THIS RUN: {setup_error}")
+        log("UPLOAD", "-", "! local data (download/encode) is unaffected and keeps "
+           "running normally — fix this, then re-run the SAME command; everything "
+           "encoded so far is still there and will upload on the next run.")
+        # Keep nagging periodically instead of just dying — a single line at the top of
+        # a run that logs for hours (Kaggle's 12h session) is trivially lost to scrollback.
+        while not stop_event.wait(300.0):
+            log("UPLOAD", "-", f"! still disabled: {setup_error}")
         return
+
     log("UPLOAD", "-", f"repo ready: https://huggingface.co/datasets/{args.hf_repo}")
 
     while True:
@@ -743,7 +848,17 @@ def main():
     ap.add_argument("--private", action="store_true", help="create the repo private")
     ap.add_argument("--download-concurrency", type=int, default=3,
                     help="concurrent (language, source) download workers (default 3)")
-    ap.add_argument("--device", default=None, help="Mimi encoder device override (cpu/cuda/mps)")
+    ap.add_argument("--device", default=None, help="Mimi encoder device override (cpu/cuda/mps) "
+                    "— forces a SINGLE device; use --devices instead to spread encoding "
+                    "across more than one GPU")
+    ap.add_argument("--devices", default=None,
+                    help="comma-separated devices to encode on IN PARALLEL, e.g. "
+                        "'cuda:0,cuda:1' to use both of Kaggle's T4s at once. Default: "
+                        "auto-detect — uses EVERY visible CUDA device already (so this "
+                        "flag is normally optional on a 2-GPU Kaggle session), falls "
+                        "back to a single cpu worker if no GPU is visible. Each device "
+                        "gets its own persistent Mimi encoder instance + an even round-"
+                        "robin share of whatever's pending for a language.")
     ap.add_argument("--keep-raw-audio", action="store_true",
                     help="don't delete a wav after encoding it (default: delete once its "
                         ".npz is verified — a full target's raw audio alone can be tens "
@@ -796,6 +911,7 @@ def main():
     cfg = Phase1CorpusConfig.from_yaml(ROOT / args.config)
     if args.min_free_disk_gb is not None:
         cfg.min_free_disk_gb = args.min_free_disk_gb
+    args.devices_list = resolve_devices(args)
     out_dir = ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_file = manifest_path(out_dir)
@@ -822,6 +938,8 @@ def main():
         print(f"[{lang}] target={cfg.target_hours.get(lang, 0.0):.0f}h  "
              f"sources={[s.id for s in cfg.sources.get(lang, [])]}")
     print(f"download concurrency: {args.download_concurrency}")
+    print(f"encode devices: {args.devices_list}"
+         f"{'  (parallel across ' + str(len(args.devices_list)) + ' devices)' if len(args.devices_list) > 1 else ''}")
     print(f"min free disk: {cfg.min_free_disk_gb:.1f}GB (downloads pause below this)")
     print(f"HF repo: {args.hf_repo or '(uploads disabled)'}")
     print()

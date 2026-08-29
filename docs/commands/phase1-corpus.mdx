@@ -126,6 +126,31 @@ anywhere.
 
 Local-only, no upload: `python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml --no-upload`
 
+<Warning>
+**Real observed bug, now fixed:** `Uploaded` could stay stuck at 0 for an entire run
+with no visible error. Root cause: the upload worker read `HF_TOKEN` from its own
+process environment — if that's missing (very commonly on Kaggle/Jupyter: `!export
+HF_TOKEN=...` in one notebook cell does **not** persist into a later `!python ...`
+cell's subprocess, each `!` line is its own throwaway shell), the whole upload thread
+died silently the instant the run started, before printing anything. Downloads/encoding
+kept running fine, masking the problem. Fixed: this failure (and every other
+upload-setup failure) is now caught, logged loudly and repeatedly (never just once), and
+shown as a persistent red warning on the live dashboard — it can no longer fail silently.
+Set the token BEFORE launching the script, in the same process: `import os;
+os.environ["HF_TOKEN"] = "hf_..."` (or a Kaggle Secret loaded the same way) — not via a
+separate `!export` cell.
+</Warning>
+
+<Tip>
+**Both Kaggle GPUs used automatically** — pass `--devices cuda:0,cuda:1` (or nothing:
+auto-detect already picks up every visible CUDA device, so on a 2-GPU Kaggle session
+both T4s are used without any flag). Each device gets its own persistent Mimi encoder
+instance, and whatever's pending for a language is split round-robin across all of them
+and encoded in parallel — real speedup confirmed via an offline test with a mocked
+encoder (10 clips split 5/5 across two fake devices, processed concurrently). `--device
+cpu` (singular) still forces exactly one device if you ever want that instead.
+</Tip>
+
 <Tip>
 **One language at a time, for better resource management** (recommended on a
 disk/bandwidth-constrained machine like Kaggle) — pass `--lang`. Each command still runs
@@ -134,13 +159,16 @@ just that one language, so at no point are all three languages' downloads compet
 disk/network/CPU at once:
 ```bash
 python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
-    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --min-free-disk-gb 8 --lang en
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --min-free-disk-gb 8 \
+    --devices cuda:0,cuda:1 --lang en
 
 python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
-    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --min-free-disk-gb 8 --lang hi
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --min-free-disk-gb 8 \
+    --devices cuda:0,cuda:1 --lang hi
 
 python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
-    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --min-free-disk-gb 8 --lang gu
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --min-free-disk-gb 8 \
+    --devices cuda:0,cuda:1 --lang gu
 ```
 Run them one after another (wait for `en` to print "Phase-1 pipeline complete" before
 starting `hi`) — or as three separate Kaggle sessions if you want to split the 12-hour
