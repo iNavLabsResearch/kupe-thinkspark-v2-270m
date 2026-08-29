@@ -141,14 +141,24 @@ actually reproducing the hang against a fake `load_dataset` and confirming the p
 exits cleanly.) Applies to every fetch entry point (`P1_00_pipeline.py`,
 `P1_00_sequential.py`, `P1_01_fetch_corpus.py`) since all three share `fetch_source`.
 
-**Follow-up, also fixed:** a NEWER `datasets` version removed `trust_remote_code`
-entirely and raises immediately if it's passed at all ("`trust_remote_code` is not
-supported anymore") — the opposite problem from the hang above, hit on a real run right
-after the first fix landed. Now handled automatically: the first attempt passes
-`trust_remote_code=True` (for older versions that need it), and if the installed
-`datasets` rejects the kwarg outright, it retries once immediately without it — works
-across both old and new `datasets` versions with no manual pinning. Verified offline
-against both a version that hangs without the kwarg and one that errors on it.
+**Follow-up, also fixed:** the first fix above had the priority backwards — it injected
+`trust_remote_code=True` on the FIRST attempt, every time. A NEWER `datasets` version
+(4.0+) removed that kwarg entirely and raises immediately if it's passed AT ALL ("
+`trust_remote_code` is not supported anymore") — a `RuntimeError`, not `TypeError`/
+`ValueError`, so the original fallback's `except` clause didn't even catch it; the exact
+same raw error kept surfacing unchanged after pulling the fix. Corrected: every default
+source in this project (LibriSpeech, Kathbath, Shrutilipi, FLEURS, IndicTTS) is
+Parquet-backed on HF now — confirmed for `google/fleurs` specifically, "Auto-converted
+to Parquet" on its dataset page — so no trust prompt is needed at all in the common
+case. Now the FIRST attempt passes no such kwarg; `trust_remote_code=True` is only added
+on a retry if that first attempt's error message actually asks for it (an older
+`datasets` version + a genuinely script-based dataset), detected by message content
+rather than exception type, which isn't stable across versions. Verified offline against
+four scenarios: modern-datasets success (1 call, no kwarg — the real-world path now),
+the exact real error text reproduced verbatim (fails immediately, no wasted retry —
+unrecoverable on that `datasets` version), an older-datasets dataset that genuinely needs
+the flag (fails once, retries with it, succeeds), and a genuine hang (still times out
+cleanly, unaffected by the reordering).
 </Warning>
 
 <Warning>

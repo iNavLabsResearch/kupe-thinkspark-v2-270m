@@ -327,22 +327,33 @@ def _load_dataset_with_timeout(*args, timeout: float = LOAD_DATASET_TIMEOUT_S, *
             raise result["error"]
         return result["value"]
 
-    # Try WITH trust_remote_code=True first — needed on OLDER `datasets` versions for
-    # script-based datasets to avoid a hidden confirmation prompt that can hang forever
-    # (the original bug this whole function guards against). Real, observed opposite
-    # problem on a NEWER `datasets` version: it removed the kwarg entirely and raises
-    # immediately if it's passed AT ALL — "trust_remote_code is not supported anymore.
-    # Please check that the ... dataset ... isn't based on a loading script and remove
-    # `trust_remote_code`." Falling back to calling without it makes this work across
-    # both old and new `datasets` versions without sniffing the installed version.
-    call_kwargs = dict(kwargs)
-    call_kwargs.setdefault("trust_remote_code", True)
+    # Try WITHOUT trust_remote_code first — this is the common/modern case: every
+    # default source in this project's config (LibriSpeech, Kathbath, Shrutilipi,
+    # FLEURS, IndicTTS) is Parquet-backed on HF now ("Auto-converted to Parquet" on
+    # their dataset pages — confirmed for google/fleurs specifically), no script
+    # involved, so no trust prompt of any kind ever fires. An EARLIER version of this
+    # fix instead injected `trust_remote_code=True` on the FIRST attempt (to dodge an
+    # older-datasets hanging prompt) — that was backwards: on a NEWER `datasets`
+    # version (4.0+) the kwarg was removed entirely and merely PASSING it — even
+    # `=True` — raises immediately: "trust_remote_code is not supported anymore.
+    # Please check that ... isn't based on a loading script and remove
+    # `trust_remote_code`." That's a `RuntimeError` on that version, NOT `TypeError`/
+    # `ValueError` (confirmed via the actual upstream report, not guessed) — the
+    # original except clause here didn't catch it, so the raw error passed straight
+    # through unchanged on a real run. Fixed by (a) not passing the kwarg unless the
+    # first attempt's error says it's actually needed, and (b) catching broadly by
+    # message content instead of a specific exception type, since the exact type isn't
+    # stable across `datasets` versions.
     try:
-        return _attempt(call_kwargs)
-    except (TypeError, ValueError) as e:
-        if "trust_remote_code" in str(e) and "not supported" in str(e).lower():
+        return _attempt(dict(kwargs))
+    except Exception as e:
+        msg = str(e)
+        if "trust_remote_code" in msg and "not supported" not in msg.lower():
+            # Older `datasets` + a genuinely script-based dataset asking permission to
+            # run it — retry once WITH the kwarg (safe: only fires for datasets this
+            # project's config explicitly lists, e.g. an official Google/AI4Bharat repo).
             fallback_kwargs = dict(kwargs)
-            fallback_kwargs.pop("trust_remote_code", None)
+            fallback_kwargs["trust_remote_code"] = True
             return _attempt(fallback_kwargs)
         raise
 
