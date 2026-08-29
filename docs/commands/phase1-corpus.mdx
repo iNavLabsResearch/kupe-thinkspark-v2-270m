@@ -189,6 +189,32 @@ python scripts/P1_00_pipeline.py --hf-repo <your-hf-username>/kupe-thinkspark-27
 ```
 Asks "type 'yes' to confirm" first, same pattern as every other cleanup in this project.
 
+<Accordion title="Or the STRICT SEQUENTIAL version — one language, 4 separate tqdm bars, nothing overlaps">
+`scripts/P1_00_sequential.py` — the opposite scheduling from the pipelined command
+above: for one language, DOWNLOAD runs fully to completion first (its own tqdm bar),
+THEN ENCODE runs fully (its own bar, split across `--devices` in parallel), THEN UPLOAD
+runs fully (its own bar) — on the **main thread**, so a missing `HF_TOKEN` or bad repo
+raises immediately and visibly instead of ever being able to die silently in the
+background — THEN the now-uploaded local `.npz` are deleted (its own bar) to free disk
+before the next language. Nothing starts until the stage before it is 100% done.
+```bash
+# wipe everything already on the HF repo first (asks to confirm) so you push clean data:
+python scripts/P1_00_pipeline.py --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --cleanup
+
+python scripts/P1_00_sequential.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --lang en
+python scripts/P1_00_sequential.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --lang hi
+python scripts/P1_00_sequential.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --lang gu
+```
+Output layout is exactly the training format — no extra step: `data/encoded/<lang>/*.npz`
++ `data/frames_phase1/frames_<lang>.jsonl`, uploaded to `--hf-repo` in that same layout,
+ready for `scripts/19_fetch_training_data.py` -> `scripts/06_train_phase1.py` with no
+re-encoding. Fully resumable at every stage — same manifest/`.npz`/`hf_sync` checks as
+the pipelined version. `--no-upload` skips stages 3-4 (download+encode only).
+</Accordion>
+
 <Accordion title="Or the single-source-at-a-time CLI (no concurrency, no HF upload)">
 ```bash
 pip install datasets soundfile
