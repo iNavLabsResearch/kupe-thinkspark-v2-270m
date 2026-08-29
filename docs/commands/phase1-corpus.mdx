@@ -121,6 +121,16 @@ publishing it anywhere.
 
 Local-only, no upload: `python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml --no-upload`
 
+**Cleaning up what's on Hugging Face** — deletes everything currently uploaded to
+`--hf-repo` (real content, listed from the repo itself) and clears the matching local
+`hf_sync` records, so a following run re-uploads cleanly instead of thinking it's all
+already there. Local files (`data/encoded`, `data/frames_phase1`, the manifest) are
+never touched — only the remote repo and the local sync-tracking DB:
+```bash
+python scripts/P1_00_pipeline.py --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --cleanup
+```
+Asks "type 'yes' to confirm" first, same pattern as every other cleanup in this project.
+
 <Accordion title="Or the single-source-at-a-time CLI (no concurrency, no HF upload)">
 ```bash
 pip install datasets soundfile

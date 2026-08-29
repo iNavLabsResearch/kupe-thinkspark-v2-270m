@@ -207,7 +207,7 @@ and executed piece by piece, not blindly piped through in one sitting.
 | `scripts/11_monitor.py` | data-gen | live dashboard: cost, latency, unit-eval, pass/fail, ETA |
 | `scripts/12_build_report.py` | data-gen | HTML chart report — actual vs. target, cumulative spend |
 | `scripts/10_export_costs.py` | data-gen | CSV cost export from the SQLite log |
-| `scripts/P1_00_pipeline.py` | phase1-corpus | recommended: concurrent download→encode→frames→HF-upload pipeline |
+| `scripts/P1_00_pipeline.py` | phase1-corpus | recommended: concurrent download→encode→frames→HF-upload pipeline; `--cleanup` to wipe the HF repo |
 | `scripts/P1_01_fetch_corpus.py` | phase1-corpus | single-source-at-a-time fetch (no upload); streams LibriSpeech/Kathbath/Shrutilipi/FLEURS/IndicTTS |
 | `scripts/P1_02_build_frames.py` | phase1-corpus | manifest + Mimi shards → Phase-1 frame records |
 | `scripts/19_fetch_training_data.py` | publish | Kaggle-side: fetch Phase-1 + Phase-2 training data from HF |

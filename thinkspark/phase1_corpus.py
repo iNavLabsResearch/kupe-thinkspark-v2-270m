@@ -6,6 +6,17 @@ fetch logic rather than risking it drifting between two copies.
 
 See scripts/P1_01_fetch_corpus.py's module docstring for the full source list and the
 Common Voice removal story; configs/phase1_corpus.yaml for the per-language source mix.
+
+Audio decode shape: `datasets`' Audio-cast columns come back as EITHER an older plain
+dict (`{"array": np.ndarray, "sampling_rate": int}`, soundfile-based decode) OR a
+torchcodec `AudioDecoder` object (current `datasets` default once torchcodec + a working
+FFmpeg are installed — real, documented API: `.get_all_samples()` -> `AudioSamples` with
+`.data` (channel-first torch.Tensor) and `.sample_rate`, verified against
+meta-pytorch.org/torchcodec, not guessed). `detect_audio_column`/`extract_waveform`
+handle both — this project hit the real failure mode of only handling the old shape
+(worked fine before torchcodec was installed/working, then broke as
+"couldn't find an audio column" the moment FFmpeg got fixed and `datasets` switched to
+real torchcodec decoding).
 """
 
 from __future__ import annotations
@@ -126,11 +137,45 @@ def relative_or_absolute(path: Path, root: Path) -> str:
         return str(path)
 
 
+def _is_audio_value(v) -> bool:
+    """True for either shape `datasets` hands back for an Audio-cast column: the older
+    dict `{"array": ..., "sampling_rate": ...}` (soundfile-based decode), or a
+    torchcodec `AudioDecoder` object (current `datasets` default — duck-typed via
+    `get_all_samples`, since isinstance-checking a lazily-imported torchcodec class
+    would force-import torchcodec even for sources that don't need it)."""
+    if isinstance(v, dict) and "array" in v and "sampling_rate" in v:
+        return True
+    return hasattr(v, "get_all_samples")
+
+
 def detect_audio_column(row: dict) -> str | None:
     for k, v in row.items():
-        if isinstance(v, dict) and "array" in v and "sampling_rate" in v:
+        if _is_audio_value(v):
             return k
     return None
+
+
+def extract_waveform(audio_value) -> tuple:
+    """
+    Returns (numpy_array, sample_rate) for either shape `_is_audio_value` accepts.
+    Verified against torchcodec's real, documented API (meta-pytorch.org/torchcodec —
+    NOT guessed): `AudioDecoder.get_all_samples()` -> `AudioSamples`, whose `.data` is a
+    `torch.Tensor` shaped (num_channels, num_samples) in [-1, 1], and `.sample_rate` is
+    an int. soundfile wants (num_samples,) for mono or (num_samples, num_channels) for
+    multi-channel, so channel-first torch layout is transposed/squeezed accordingly.
+    Returns (None, None) if `audio_value` doesn't match either known shape.
+    """
+    import numpy as np
+
+    if isinstance(audio_value, dict) and "array" in audio_value and "sampling_rate" in audio_value:
+        return np.asarray(audio_value["array"], dtype=np.float32), int(audio_value["sampling_rate"])
+    if hasattr(audio_value, "get_all_samples"):
+        samples = audio_value.get_all_samples()
+        arr = samples.data.numpy()
+        if arr.ndim == 2:
+            arr = arr[0] if arr.shape[0] == 1 else arr.T   # (channels, N) -> mono (N,) or (N, channels)
+        return arr.astype(np.float32), int(samples.sample_rate)
+    return None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -305,9 +350,11 @@ def fetch_source(
 
                 try:
                     audio = row.get(audio_col)
-                    if not audio or "array" not in audio:
+                    if audio is None:
                         continue
-                    arr, sr = audio["array"], audio["sampling_rate"]
+                    arr, sr = extract_waveform(audio)
+                    if arr is None:
+                        continue
                     duration_s = len(arr) / float(sr)
                     if duration_s < cfg.min_clip_seconds or duration_s > cfg.max_clip_seconds:
                         continue

@@ -270,6 +270,19 @@ class RunDB:
             ).fetchall()
         return {r[0] for r in rows}
 
+    def clear_hf_sync(self, repo_id: str) -> int:
+        """Delete every hf_sync row for repo_id — pairs with actually deleting the
+        content from that repo remotely (scripts/P1_00_pipeline.py --cleanup), so a
+        subsequent real run doesn't think everything is already uploaded and skip it.
+        Returns the number of rows removed."""
+        with self._lock:
+            n = self._conn.execute(
+                "SELECT COUNT(*) FROM hf_sync WHERE repo_id=?", (repo_id,)
+            ).fetchone()[0]
+            self._conn.execute("DELETE FROM hf_sync WHERE repo_id=?", (repo_id,))
+            self._conn.commit()
+        return n
+
     def unit_eval_summary(self, run_id: str | None = None) -> dict:
         """Pass/fail counts for one run, or across all runs if run_id is None."""
         with self._lock:

@@ -53,6 +53,13 @@ scripts/06_train_phase1.py can train on immediately, no re-encoding needed.
 
     # local only, no HF upload:
     python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml --no-upload
+
+    # delete everything already uploaded to the HF repo (encoded/, frames_phase1/,
+    # manifest.jsonl, README.md) AND the matching local hf_sync records, so a following
+    # real run re-uploads cleanly instead of thinking it's all already there. Asks for
+    # confirmation first; local files (data/encoded, data/frames_phase1, manifest) are
+    # NEVER touched by this — only the remote repo + the local sync-tracking DB:
+    python scripts/P1_00_pipeline.py --hf-repo anuj-inavlabs/kupe-thinkspark-270m-phase1-data --cleanup
 """
 
 from __future__ import annotations
@@ -427,6 +434,87 @@ def _upload_final_manifest_and_readme(api, args, log) -> None:
 
 
 # --------------------------------------------------------------------------- #
+def _run_cleanup(args) -> None:
+    """Deletes everything currently uploaded to args.hf_repo — real content, listed
+    from the repo itself (not assumed) — and clears this repo's hf_sync rows in the
+    local DB so a subsequent real run re-uploads cleanly instead of thinking it's all
+    already there. Never touches local files (data/encoded, data/frames_phase1,
+    data/phase1_raw/manifest.jsonl are all left exactly as they are)."""
+    try:
+        from huggingface_hub import CommitOperationDelete, HfApi
+    except ImportError:
+        raise SystemExit("`huggingface_hub` not installed. `pip install huggingface_hub`.")
+
+    token = env("HF_TOKEN", required=True)
+    api = HfApi(token=token)
+
+    print("=" * 68)
+    print(f"ThinkSpark-v2-350M — Phase-1 HF cleanup: {args.hf_repo}")
+    print("=" * 68)
+
+    try:
+        files = api.list_repo_files(repo_id=args.hf_repo, repo_type="dataset")
+    except Exception as e:
+        msg = str(e).lower()
+        if "404" in msg or "not found" in msg:
+            print(f"repo {args.hf_repo} doesn't exist (or has nothing in it) — nothing to clean up.")
+            return
+        raise SystemExit(f"couldn't list files in {args.hf_repo}: {e}")
+
+    if not files:
+        print("repo exists but is empty — nothing to clean up.")
+        return
+
+    # group into top-level entries (folders vs bare files) purely from what's REALLY
+    # there, not an assumed fixed layout — so this also cleans up anything left over
+    # from an older/different run shape
+    top_level: dict[str, bool] = {}   # name -> is_folder
+    for f in files:
+        if "/" in f:
+            top_level[f.split("/", 1)[0]] = True
+        else:
+            top_level.setdefault(f, False)
+
+    print(f"found {len(files)} file(s) under {len(top_level)} top-level entr{'y' if len(top_level)==1 else 'ies'}:")
+    for name, is_folder in sorted(top_level.items()):
+        n = sum(1 for f in files if f == name or f.startswith(name + "/"))
+        print(f"  {'[dir] ' if is_folder else '[file]'} {name}  ({n} file{'s' if n != 1 else ''})")
+
+    db = RunDB(ROOT / args.db)
+    n_synced = len(db.hf_synced_ids(args.hf_repo))
+    print(f"\nlocal hf_sync records for this repo: {n_synced} (will also be cleared)")
+    print("local files (data/encoded, data/frames_phase1, manifest.jsonl) are NOT touched.")
+
+    try:
+        answer = input(f"\nDelete all {len(files)} file(s) from {args.hf_repo} and clear "
+                       f"{n_synced} local sync record(s)? Type 'yes' to confirm: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\ncancelled.")
+        db.close()
+        return
+    if answer.lower() != "yes":
+        print("cancelled — nothing deleted.")
+        db.close()
+        return
+
+    ops = [CommitOperationDelete(path_in_repo=name, is_folder=is_folder)
+          for name, is_folder in top_level.items()]
+    print(f"\ndeleting {len(ops)} top-level entr{'y' if len(ops)==1 else 'ies'} in one commit...")
+    create_commit_with_backoff(
+        api, repo=args.hf_repo, operations=ops,
+        commit_message="cleanup: remove all phase1 pipeline content",
+        max_retries=args.max_retries, base_backoff=args.backoff, max_backoff=args.max_backoff,
+        log_fn=print,
+    )
+
+    n_cleared = db.clear_hf_sync(args.hf_repo)
+    db.close()
+    print(f"\ndone — {args.hf_repo} is now empty, {n_cleared} local sync record(s) cleared.")
+    print("re-run scripts/P1_00_pipeline.py normally — it will re-upload from your local data/ "
+         "encoded+frames files (no re-download or re-encode needed, they're untouched).")
+
+
+# --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/phase1_corpus.yaml")
@@ -449,7 +537,18 @@ def main():
     ap.add_argument("--max-backoff", type=float, default=300.0)
     ap.add_argument("--max-retries", type=int, default=10)
     ap.add_argument("--dry-run", action="store_true", help="print the plan, touch nothing")
+    ap.add_argument("--cleanup", action="store_true",
+                    help="delete everything already uploaded to --hf-repo (encoded/, "
+                        "frames_phase1/, manifest.jsonl, README.md) + the matching local "
+                        "hf_sync records, so a following run re-uploads cleanly; asks for "
+                        "confirmation first. Local files (data/encoded etc.) are untouched.")
     args = ap.parse_args()
+
+    if args.cleanup:
+        if not args.hf_repo:
+            raise SystemExit("--cleanup needs --hf-repo (which repo to clean up)")
+        _run_cleanup(args)
+        return
 
     if not args.no_upload and not args.hf_repo:
         raise SystemExit("--hf-repo is required unless --no-upload is set "
