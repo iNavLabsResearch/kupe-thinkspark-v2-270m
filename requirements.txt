@@ -22,6 +22,13 @@ soundfile>=0.12            # robust wav io (optional; stdlib wave is the fallbac
 
 # ---- Phase-1 corpus fetch (scripts/P1_01_fetch_corpus.py) -------------------
 datasets>=2.19             # streams Common Voice / Kathbath / Shrutilipi / FLEURS / IndicTTS
+# REQUIRED as of `datasets` 4.x/5.x — real observed failure without it: streaming an
+# Audio-cast column raises "To support decoding audio data, please install 'torchcodec'."
+# immediately on the first row (not a warning, a hard stop). `pip install torchcodec`
+# alone pulls a build matched to whatever `torch` is already installed via PyPI's normal
+# dependency resolution — no separate CUDA-specific package needed for this project's use
+# (CPU-side tensor decode of small clips), even on a GPU box.
+torchcodec>=0.1
 
 # ---- data generation --------------------------------------------------------
 openai>=1.40               # scenario + label writer + LLM-judge (any OpenAI-compatible endpoint)

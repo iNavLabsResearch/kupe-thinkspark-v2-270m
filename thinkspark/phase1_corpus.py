@@ -21,6 +21,7 @@ real torchcodec decoding).
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -613,6 +614,31 @@ def fetch_source(
             raise   # a real "column doesn't exist" / gated / etc. — not retryable, surface it
         except Exception as e:
             last_err = e
+            # Real observed secondary crash (not theoretical): raising straight out of
+            # this `for row in ds:` loop can leave the streaming iterator's own internal
+            # resources (torchcodec/aiohttp worker threads, in-flight async I/O) still
+            # alive when the process exits right after — CPython's interpreter shutdown
+            # then races those resources' own C-extension threads, producing a `Fatal
+            # Python error: PyGILState_Release: thread state ... must be current` crash
+            # and `Aborted (core dumped)`, seen on a real run right after a torchcodec
+            # ImportError. Explicitly dropping the reference and forcing a collection
+            # HERE — while the interpreter is still fully alive, not mid-finalization —
+            # gives those resources a normal chance to clean up instead of leaking into
+            # shutdown. Not a 100% guarantee against every possible native-extension
+            # shutdown race, but removes the specific one observed.
+            del ds
+            gc.collect()
+            if "torchcodec" in str(e).lower():
+                # Not transient — retrying the identical call won't install a package.
+                # Surface the real fix immediately instead of burning 3 more retries
+                # first (each with its own wait) just to report the same thing later.
+                raise SystemExit(
+                    f"{spec.hf_dataset}/{spec.hf_config}: `datasets` needs `torchcodec` "
+                    f"to decode audio and it isn't installed — run `pip install "
+                    f"torchcodec` (it pulls a build matched to your already-installed "
+                    f"`torch`), then re-run this exact command; it resumes from "
+                    f"{written} clip(s) already written this attempt. Original error: {e}"
+                ) from last_err
             if looks_transient(e) and attempt < STREAM_RETRY_ATTEMPTS - 1:
                 wait = 2.0 * (attempt + 1)
                 log_fn(f"transient error mid-stream (attempt {attempt + 1}/"
