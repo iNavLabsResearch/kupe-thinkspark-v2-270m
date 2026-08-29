@@ -82,7 +82,15 @@ class MimiEncoder:
             # cores so there's real headroom left for concurrent torch work elsewhere in
             # the same process; encoding a single short clip doesn't need every core.
             torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2))
-        self._model = MimiModel.from_pretrained(self.repo).to(dev).eval()
+        # `low_cpu_mem_usage=True`: without it, `from_pretrained` materializes the model
+        # TWICE in RAM during load (once for the randomly-initialized skeleton, once
+        # again when the real weights are read in) before freeing the first copy — on a
+        # small box (real observed case: a 4GB droplet, `s-2vcpu-4gb`) that extra
+        # transient peak on top of torch/transformers' own import footprint is enough to
+        # trigger the Linux OOM killer (`Killed`, no Python traceback — can't be caught
+        # or retried, the process is just gone). This flag loads weights directly into
+        # their final tensors instead, roughly halving the peak RAM during load.
+        self._model = MimiModel.from_pretrained(self.repo, low_cpu_mem_usage=True).to(dev).eval()
         self._fe = AutoFeatureExtractor.from_pretrained(self.repo)
         # codebook size from config (used to size the model's audio embedding table)
         self._codebook_size = int(getattr(self._model.config, "codebook_size", 2048))
