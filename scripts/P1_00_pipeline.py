@@ -745,13 +745,21 @@ def _upload_final_manifest_and_readme(api, args, log) -> None:
 
 # --------------------------------------------------------------------------- #
 def _run_cleanup(args) -> None:
-    """Deletes everything currently uploaded to args.hf_repo — real content, listed
-    from the repo itself (not assumed) — and clears this repo's hf_sync rows in the
-    local DB so a subsequent real run re-uploads cleanly instead of thinking it's all
-    already there. Never touches local files (data/encoded, data/frames_phase1,
-    data/phase1_raw/manifest.jsonl are all left exactly as they are)."""
+    """Deletes the ENTIRE HF dataset repo (not its individual files) — the FAST way to
+    wipe everything and start clean, and clears this repo's hf_sync rows in the local
+    DB. Never touches local files (data/encoded, data/frames_phase1,
+    data/phase1_raw/manifest.jsonl are all left exactly as they are).
+
+    Real observed problem this fixes: the previous version listed every file
+    (`api.list_repo_files()`) and deleted top-level folders in one commit — correct, but
+    for a repo with tens of thousands of files (real case: 25,704+ files spread across
+    hundreds of bucketed subfolders), just the LISTING call alone took long enough that
+    it looked hung, before any deletion had even started. Deleting the whole repo is a
+    single, near-instant API call regardless of how many files are in it — git history
+    and all, gone in one shot — and the next normal upload run recreates it fresh
+    automatically via `ensure_repo()`, so there's no separate recreate step needed here."""
     try:
-        from huggingface_hub import CommitOperationDelete, HfApi
+        from huggingface_hub import HfApi
     except ImportError:
         raise SystemExit("`huggingface_hub` not installed. `pip install huggingface_hub`.")
 
@@ -762,42 +770,29 @@ def _run_cleanup(args) -> None:
     print(f"ThinkSpark-v2-350M — Phase-1 HF cleanup: {args.hf_repo}")
     print("=" * 68)
 
+    # `repo_info()` (no file listing) is a single lightweight call, unlike
+    # `list_repo_files()` — just enough to confirm the repo exists before asking to
+    # delete it.
     try:
-        files = api.list_repo_files(repo_id=args.hf_repo, repo_type="dataset")
+        info = api.repo_info(repo_id=args.hf_repo, repo_type="dataset")
     except Exception as e:
         msg = str(e).lower()
         if "404" in msg or "not found" in msg:
-            print(f"repo {args.hf_repo} doesn't exist (or has nothing in it) — nothing to clean up.")
+            print(f"repo {args.hf_repo} doesn't exist — nothing to clean up.")
             return
-        raise SystemExit(f"couldn't list files in {args.hf_repo}: {e}")
+        raise SystemExit(f"couldn't check {args.hf_repo}: {e}")
 
-    if not files:
-        print("repo exists but is empty — nothing to clean up.")
-        return
-
-    # group into top-level entries (folders vs bare files) purely from what's REALLY
-    # there, not an assumed fixed layout — so this also cleans up anything left over
-    # from an older/different run shape
-    top_level: dict[str, bool] = {}   # name -> is_folder
-    for f in files:
-        if "/" in f:
-            top_level[f.split("/", 1)[0]] = True
-        else:
-            top_level.setdefault(f, False)
-
-    print(f"found {len(files)} file(s) under {len(top_level)} top-level entr{'y' if len(top_level)==1 else 'ies'}:")
-    for name, is_folder in sorted(top_level.items()):
-        n = sum(1 for f in files if f == name or f.startswith(name + "/"))
-        print(f"  {'[dir] ' if is_folder else '[file]'} {name}  ({n} file{'s' if n != 1 else ''})")
+    print(f"repo exists (private={info.private}).")
 
     db = RunDB(ROOT / args.db)
     n_synced = len(db.hf_synced_ids(args.hf_repo))
-    print(f"\nlocal hf_sync records for this repo: {n_synced} (will also be cleared)")
+    print(f"local hf_sync records for this repo: {n_synced} (will also be cleared)")
     print("local files (data/encoded, data/frames_phase1, manifest.jsonl) are NOT touched.")
 
     try:
-        answer = input(f"\nDelete all {len(files)} file(s) from {args.hf_repo} and clear "
-                       f"{n_synced} local sync record(s)? Type 'yes' to confirm: ").strip()
+        answer = input(f"\nDELETE THE ENTIRE REPO {args.hf_repo} (all files + history) "
+                       f"and clear {n_synced} local sync record(s)? "
+                       f"Type 'yes' to confirm: ").strip()
     except (EOFError, KeyboardInterrupt):
         print("\ncancelled.")
         db.close()
@@ -807,21 +802,15 @@ def _run_cleanup(args) -> None:
         db.close()
         return
 
-    ops = [CommitOperationDelete(path_in_repo=name, is_folder=is_folder)
-          for name, is_folder in top_level.items()]
-    print(f"\ndeleting {len(ops)} top-level entr{'y' if len(ops)==1 else 'ies'} in one commit...")
-    create_commit_with_backoff(
-        api, repo=args.hf_repo, operations=ops,
-        commit_message="cleanup: remove all phase1 pipeline content",
-        max_retries=args.max_retries, base_backoff=args.backoff, max_backoff=args.max_backoff,
-        log_fn=print,
-    )
+    print(f"\ndeleting repo {args.hf_repo}...")
+    api.delete_repo(repo_id=args.hf_repo, repo_type="dataset")
 
     n_cleared = db.clear_hf_sync(args.hf_repo)
     db.close()
-    print(f"\ndone — {args.hf_repo} is now empty, {n_cleared} local sync record(s) cleared.")
-    print("re-run scripts/P1_00_pipeline.py normally — it will re-upload from your local data/ "
-         "encoded+frames files (no re-download or re-encode needed, they're untouched).")
+    print(f"\ndone — {args.hf_repo} deleted, {n_cleared} local sync record(s) cleared.")
+    print("re-run your upload command normally — it recreates the repo fresh (private="
+         f"{info.private}, pass --private to keep that) and re-uploads from your local "
+         "data/ (no re-download or re-encode needed, they're untouched).")
 
 
 # --------------------------------------------------------------------------- #

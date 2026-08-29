@@ -232,15 +232,27 @@ all-languages-at-once run). `--lang en,hi` also works if you want exactly two of
 three together.
 </Tip>
 
-**Cleaning up what's on Hugging Face** — deletes everything currently uploaded to
-`--hf-repo` (real content, listed from the repo itself) and clears the matching local
-`hf_sync` records, so a following run re-uploads cleanly instead of thinking it's all
-already there. Local files (`data/encoded`, `data/frames_phase1`, the manifest) are
-never touched — only the remote repo and the local sync-tracking DB:
+**Cleaning up what's on Hugging Face** — deletes the ENTIRE `--hf-repo` (fast: one API
+call regardless of file count, not a per-file listing+delete) and clears the matching
+local `hf_sync` records, so a following run re-uploads cleanly into a freshly-recreated
+repo. Local files (`data/encoded`, `data/frames_phase1`, the manifest) are never touched
+— only the remote repo and the local sync-tracking DB:
 ```bash
 python scripts/P1_00_pipeline.py --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --cleanup
 ```
 Asks "type 'yes' to confirm" first, same pattern as every other cleanup in this project.
+
+<Warning>
+**Real observed slowness, fixed:** this used to list every file in the repo first
+(`list_repo_files()`), then delete top-level folders — correct, but for a repo with tens
+of thousands of files (25,704+, spread across hundreds of bucketed subfolders), the
+LISTING call alone took long enough to look hung, before any deletion even started. Now
+it deletes the whole repo directly (`delete_repo()`) — a single near-instant call no
+matter how many files are in it — and the next upload run recreates it fresh
+automatically. If the repo was private, pass `--private` on your next upload command to
+recreate it that way (the old privacy setting isn't carried over automatically once the
+repo itself is gone).
+</Warning>
 
 <Accordion title="Or the STRICT SEQUENTIAL version — one language, 4 separate tqdm bars, nothing overlaps">
 `scripts/P1_00_sequential.py` — the opposite scheduling from the pipelined command
