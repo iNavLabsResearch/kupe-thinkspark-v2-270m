@@ -73,9 +73,17 @@ def main():
     ap.add_argument("--lang", default=None, help="only fetch this language (en/hi/gu)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the plan (targets, gating, remaining hours) without downloading")
+    ap.add_argument("--min-free-disk-gb", type=float, default=None,
+                    help="pause writes whenever free disk drops below this many GB "
+                        "(default: configs/phase1_corpus.yaml's min_free_disk_gb, 3.0 if "
+                        "unset) — same backpressure P1_00_pipeline.py uses, since this "
+                        "CLI's single-threaded download can still outrun disk on a small "
+                        "volume if you encode separately/later than you download")
     args = ap.parse_args()
 
     cfg = Phase1CorpusConfig.from_yaml(ROOT / args.config)
+    if args.min_free_disk_gb is not None:
+        cfg.min_free_disk_gb = args.min_free_disk_gb
     out_dir = ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_file = manifest_path(out_dir)

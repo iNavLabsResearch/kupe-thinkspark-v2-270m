@@ -176,6 +176,27 @@ for fetching Phase-2 in the same command.
 
 ## How it stays bounded on Kaggle
 
+<Warning>
+**Real observed failure (2026-08-29):** on Kaggle's fast network, concurrent downloads
+(~92 clips/sec) vastly outpaced the single Mimi encoder's encode+delete rate (~2
+clips/sec). The periodic 90s encode sweep alone couldn't drain a backlog growing that
+much faster than it emptied, and the run died with `[Errno 28] No space left on
+device` — which then cascaded into every other error in that run's log (download
+"System error"s, encode-stage ENOSPC with `ZipFile.__del__` tracebacks): all downstream
+symptoms of that one root cause, not separate bugs.
+
+Fixed with **proactive disk-space backpressure**: every ~20 clips written, the fetcher
+checks real free disk space (`shutil.disk_usage`) and, if it's under `min_free_disk_gb`
+(`configs/phase1_corpus.yaml`, default 5.0GB — comfortable headroom on Kaggle's 57.6GiB
+session disk), blocks and polls every 5s until the encoder's wav-delete-after-encode
+frees enough room, logging `pausing downloads...` / `still waiting...` /
+`disk space recovered...` so it's visible in the run's logs rather than silent. Override
+per-run with `--min-free-disk-gb` on either `P1_00_pipeline.py` or
+`P1_01_fetch_corpus.py`. This turns "crash once disk fills" into "downloads
+self-throttle to encoding speed", regardless of how fast the network or how slow the
+encoder is on a given machine.
+</Warning>
+
 Every source is opened with `datasets.load_dataset(..., streaming=True)` — nothing
 downloads in full. The fetcher stops **per source** the instant its share of the
 language's target hours is reached:

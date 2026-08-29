@@ -232,7 +232,11 @@ def encode_and_build_frames(lang: str, cfg, args, log, status) -> int:
     if _encoder is None:
         log("ENCODE", lang, f"loading Mimi encoder ({cfg.mimi_repo if hasattr(cfg, 'mimi_repo') else 'kyutai/mimi'})...")
         _encoder = MimiEncoder(repo=getattr(cfg, "mimi_repo", "kyutai/mimi"), device=args.device)
-        log("ENCODE", lang, f"Mimi encoder ready (codebook_size={_encoder.codebook_size})")
+        cb_size = _encoder.codebook_size   # triggers _ensure_loaded(), so _device is set below
+        # Visibility for "GPU shows 0% util despite active encoding" reports: confirms
+        # which device the encoder actually loaded on, rather than guessing from
+        # external monitors whose sampling interval can miss short per-clip GPU bursts.
+        log("ENCODE", lang, f"Mimi encoder ready (device={_encoder._device}, codebook_size={cb_size})")
 
     wav_dir = ROOT / args.out_dir / lang
     encoded_dir = ROOT / args.encoded_dir
@@ -631,6 +635,13 @@ def main():
                         "only start once an entire language's full download finished")
     ap.add_argument("--files-per-commit", type=int, default=200,
                     help="max .npz files packed into one HF commit (default 200)")
+    ap.add_argument("--min-free-disk-gb", type=float, default=None,
+                    help="pause downloads (polling until the encoder frees space via "
+                        "wav-delete-after-encode) whenever free disk drops below this "
+                        "many GB (default: configs/phase1_corpus.yaml's min_free_disk_gb, "
+                        "itself 3.0 if unset) — the fix for a fast connection (e.g. "
+                        "Kaggle) outrunning the encoder and hitting ENOSPC. Raise this on "
+                        "a small disk (e.g. Kaggle's 57.6GiB) if it still fills.")
     ap.add_argument("--sleep", type=float, default=2.0)
     ap.add_argument("--backoff", type=float, default=20.0)
     ap.add_argument("--max-backoff", type=float, default=300.0)
@@ -654,6 +665,8 @@ def main():
                          "(e.g. --hf-repo anuj-inavlabs/kupe-thinkspark-270m-phase1-data)")
 
     cfg = Phase1CorpusConfig.from_yaml(ROOT / args.config)
+    if args.min_free_disk_gb is not None:
+        cfg.min_free_disk_gb = args.min_free_disk_gb
     out_dir = ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_file = manifest_path(out_dir)
@@ -671,6 +684,7 @@ def main():
         print(f"[{lang}] target={cfg.target_hours.get(lang, 0.0):.0f}h  "
              f"sources={[s.id for s in cfg.sources.get(lang, [])]}")
     print(f"download concurrency: {args.download_concurrency}")
+    print(f"min free disk: {cfg.min_free_disk_gb:.1f}GB (downloads pause below this)")
     print(f"HF repo: {args.hf_repo or '(uploads disabled)'}")
     print()
 

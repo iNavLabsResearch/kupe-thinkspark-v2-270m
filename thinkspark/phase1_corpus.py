@@ -67,6 +67,15 @@ class Phase1CorpusConfig:
     sample_rate: int = 24000
     min_clip_seconds: float = 1.5
     max_clip_seconds: float = 20.0
+    # Real, observed failure this guards against: on a fast connection (e.g. Kaggle),
+    # downloads can outrun a single Mimi encoder by 50-60x — periodic encode+delete
+    # sweeps alone can't drain a backlog that grows faster than they empty it, and the
+    # whole run dies with ENOSPC. This makes every WRITE check real free disk space
+    # first and BLOCK (not crash) once it's low, giving the encode side time to catch
+    # up and free space via wav-delete-after-encode — turning "crash when disk fills"
+    # into "downloads pace themselves to encoding speed", regardless of how fast the
+    # network or how slow the encoder is on a given machine.
+    min_free_disk_gb: float = 3.0
 
     @staticmethod
     def from_yaml(path: str) -> "Phase1CorpusConfig":
@@ -82,6 +91,7 @@ class Phase1CorpusConfig:
             sample_rate=int(raw.get("sample_rate", 24000)),
             min_clip_seconds=float(raw.get("min_clip_seconds", 1.5)),
             max_clip_seconds=float(raw.get("max_clip_seconds", 20.0)),
+            min_free_disk_gb=float(raw.get("min_free_disk_gb", 3.0)),
         )
 
 
@@ -207,6 +217,57 @@ STREAM_RETRY_ATTEMPTS = 4        # fresh-iterator retries on a transient mid-str
 def looks_transient(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(m in msg for m in _TRANSIENT_PHRASES) or bool(_TRANSIENT_STATUS_RE.search(msg))
+
+
+# --------------------------------------------------------------------------- #
+# Proactive disk-space backpressure — real observed failure on Kaggle: download
+# throughput (~92 clips/sec across concurrent sources) vastly outpaced the single Mimi
+# encoder's encode+delete rate (~2 clips/sec), so the periodic 90s encode sweep alone
+# could never drain the backlog fast enough, and the run died with
+# `[Errno 28] No space left on device` — which then cascaded into every OTHER error in
+# that log (download "System error"s, encode-stage ENOSPC, ZipFile.__del__ tracebacks):
+# all downstream symptoms of this one root cause, not separate bugs. This makes every
+# write CHECK real free space first and BLOCK until the encode/delete side frees enough
+# room, instead of writing blind and letting the OS crash the process once it's too late.
+DISK_CHECK_EVERY_N_WRITES = 20       # stat() the filesystem every N clips, not every clip
+DISK_WAIT_POLL_S = 5.0               # how often to recheck while blocked and waiting
+DISK_WAIT_LOG_EVERY_S = 30.0         # don't spam the log every 5s while blocked
+
+
+def _free_disk_gb(path: Path) -> float:
+    import shutil as _shutil
+    return _shutil.disk_usage(str(path)).free / (1024 ** 3)
+
+
+def wait_for_disk_headroom(path: Path, min_free_gb: float, log_fn: Callable[[str], None] = print) -> None:
+    """Block (polling) until `path`'s filesystem has at least `min_free_gb` free.
+    Relies on something else in the process (scripts/P1_00_pipeline.py's encode sweep,
+    which deletes each wav right after it's encoded) actually freeing space while this
+    blocks — a download thread parked here isn't burning CPU, it's just polling stat()
+    every few seconds, so it doesn't fight the encoder for the machine's real resources
+    (unlike the earlier GIL-starvation issue, which was about CPU, not disk)."""
+    free_gb = _free_disk_gb(path)
+    if free_gb >= min_free_gb:
+        return
+    log_fn(f"low disk space ({free_gb:.2f}GB free < {min_free_gb:.2f}GB threshold) — "
+           f"pausing downloads until the encoder frees more space")
+    last_log = time.monotonic()
+    while free_gb < min_free_gb:
+        time.sleep(DISK_WAIT_POLL_S)
+        free_gb = _free_disk_gb(path)
+        # Re-check the exit condition BEFORE logging "still waiting" — without this, the
+        # exact poll that recovers enough space could still print a "still waiting ...
+        # 6.00GB free < 3.00GB threshold" message (true a moment ago, false and
+        # self-contradictory by the time it's printed). Confirmed via an offline test
+        # with a mocked disk_usage sequence that recovers on the periodic-log tick.
+        if free_gb >= min_free_gb:
+            break
+        now = time.monotonic()
+        if now - last_log >= DISK_WAIT_LOG_EVERY_S:
+            log_fn(f"still waiting for disk space ({free_gb:.2f}GB free < "
+                   f"{min_free_gb:.2f}GB threshold)")
+            last_log = now
+    log_fn(f"disk space recovered ({free_gb:.2f}GB free) — resuming downloads")
 
 
 # --------------------------------------------------------------------------- #
@@ -378,6 +439,15 @@ def fetch_source(
                             gender = "female"
                         elif raw_g.startswith("m"):
                             gender = "male"
+
+                    # Proactive backpressure: check real free disk space BEFORE writing,
+                    # not just periodically after the fact. Checked every N writes (not
+                    # every single one) since stat() on every clip would be wasteful, but
+                    # frequently enough that a fast source can't blow through the whole
+                    # threshold between checks (~1.5-20s of audio per clip at ~48KB/s raw
+                    # is small — 20 clips is still well inside the safety margin below).
+                    if written % DISK_CHECK_EVERY_N_WRITES == 0:
+                        wait_for_disk_headroom(out_dir, cfg.min_free_disk_gb, log_fn)
 
                     cid = clip_id(lang, spec.id, row_index)
                     wav_path = lang_dir / f"{spec.id}_{cid}.wav"

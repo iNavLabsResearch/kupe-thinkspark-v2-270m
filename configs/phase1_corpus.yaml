@@ -33,6 +33,18 @@ sample_rate: 24000        # matches Mimi's operating rate (thinkspark.mimi_codec
 min_clip_seconds: 1.5     # drop clips too short to carry a real training window
 max_clip_seconds: 20.0    # drop/trim clips longer than a Phase-2-sized window (Section 4)
 
+# Pause downloads (P1_00_pipeline.py / P1_01_fetch_corpus.py) whenever free disk drops
+# below this many GB, until the encoder frees space back up via wav-delete-after-encode.
+# Real observed failure this guards against: on Kaggle's fast network, downloads (~92
+# clips/sec across concurrent sources) can vastly outpace a single Mimi encoder's
+# encode+delete rate (~2 clips/sec) — a fixed 90s periodic encode sweep alone can't drain
+# a backlog growing that much faster than it empties, so the run died with
+# `[Errno 28] No space left on device` (which then cascaded into every other error in
+# that run's log — all downstream symptoms of this one root cause). 5.0GB leaves comfortable
+# headroom on Kaggle's 57.6GiB session disk; raise it if a run still gets close to full,
+# lower it (e.g. 2.0) only on a machine with much more disk to spare.
+min_free_disk_gb: 5.0
+
 # --------------------------------------------------------------------------------- #
 # Sources per language. `weight` is this source's share of that language's
 # target_hours (weights within a language should sum to ~1.0). `gated: true` means the
