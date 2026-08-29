@@ -127,6 +127,22 @@ anywhere.
 Local-only, no upload: `python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml --no-upload`
 
 <Warning>
+**Real observed bug, now fixed:** opening a source could hang forever with zero output
+and `Ctrl+C` not responding (observed on `google/fleurs` specifically — every other
+source in the same run opened fine). Root cause: `datasets.load_dataset()` had no
+timeout at all, and for script-based datasets like fleurs can block on a hidden
+confirmation prompt (`trust_remote_code`) that has nowhere to be answered in a non-
+interactive run. Fixed two ways: `trust_remote_code=True` is now passed explicitly (an
+official Google dataset — safe), and every `load_dataset()` call now runs under a 120s
+watchdog — a genuine hang now raises a clear, retried error instead of blocking forever.
+(An earlier version of this fix used a thread pool whose worker thread would itself leak
+and block the whole Python process from exiting if the hang were real; verified fixed by
+actually reproducing the hang against a fake `load_dataset` and confirming the process
+exits cleanly.) Applies to every fetch entry point (`P1_00_pipeline.py`,
+`P1_00_sequential.py`, `P1_01_fetch_corpus.py`) since all three share `fetch_source`.
+</Warning>
+
+<Warning>
 **Real observed bug, now fixed:** `Uploaded` could stay stuck at 0 for an entire run
 with no visible error. Root cause: the upload worker read `HF_TOKEN` from its own
 process environment — if that's missing (very commonly on Kaggle/Jupyter: `!export

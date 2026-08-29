@@ -271,6 +271,63 @@ def wait_for_disk_headroom(path: Path, min_free_gb: float, log_fn: Callable[[str
 
 
 # --------------------------------------------------------------------------- #
+# Real observed hang (not theoretical): `load_dataset(...)` for `google/fleurs` froze
+# indefinitely — every OTHER source in the same run opened fine, this one printed its
+# "starting" line and then produced ZERO further output, and Ctrl+C didn't respond. The
+# `datasets` library, for datasets that ship a loading SCRIPT (fleurs is one — several
+# other legacy/community HF datasets are too) rather than a plain parquet layout, can
+# block on a hidden `input()` prompt asking to confirm running that script's custom code
+# when `trust_remote_code` isn't passed explicitly — a blocking stdin read is exactly
+# what produces a silent, Ctrl+C-resistant hang with no exception and no timeout,
+# matching what was observed. Two independent fixes, since the exact cause can't be
+# confirmed without reproducing it live: (1) pass `trust_remote_code=True` explicitly so
+# that prompt never fires for fleurs (an official Google dataset — safe to trust); (2) a
+# hard watchdog timeout around the call regardless of cause, so ANY hang (this one, a
+# genuine network stall, HF being slow to index a dataset) times out with a clear error
+# and gets picked up by the existing transient-retry loop, instead of blocking forever
+# with zero feedback. A timed-out background thread can't be force-killed in Python — it
+# leaks as a harmless zombie thread rather than actually stopping, which is an accepted
+# trade-off for turning "hangs forever, silently" into "fails loudly and retries".
+LOAD_DATASET_TIMEOUT_S = 120.0
+
+
+def _load_dataset_with_timeout(*args, timeout: float = LOAD_DATASET_TIMEOUT_S, **kwargs):
+    # A `concurrent.futures.ThreadPoolExecutor` was tried here first and is WRONG: its
+    # worker threads are non-daemon, so if the call genuinely never returns (a true
+    # network stall, not just this one bug), that thread leaks forever and the whole
+    # Python PROCESS then hangs at exit waiting to join it — CPython won't shut down
+    # until every non-daemon thread finishes. Confirmed by hanging an actual test run on
+    # this exact code before switching to `threading.Thread(daemon=True)` below: a daemon
+    # thread is killed automatically when the process exits, so a still-hung load stays
+    # contained to "this one attempt returned a timeout error" and never blocks exit.
+    import threading
+
+    from datasets import load_dataset
+
+    kwargs.setdefault("trust_remote_code", True)
+    result: dict = {}
+
+    def _run():
+        try:
+            result["value"] = load_dataset(*args, **kwargs)
+        except Exception as e:
+            result["error"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        raise RuntimeError(
+            f"load_dataset() timed out after {timeout:.0f}s opening "
+            f"{args[0] if args else kwargs.get('path')} — likely a network stall or a "
+            f"blocked confirmation prompt; will retry with a fresh attempt (timeout)"
+        )
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
+# --------------------------------------------------------------------------- #
 def fetch_source(
     cfg: Phase1CorpusConfig,
     lang: str,
@@ -316,7 +373,7 @@ def fetch_source(
                "gated": spec.gated}
 
     try:
-        from datasets import Audio, load_dataset
+        from datasets import Audio
     except ImportError:
         raise SystemExit("`datasets` not installed. `pip install datasets soundfile`.")
 
@@ -346,7 +403,7 @@ def fetch_source(
     # as a normal script restart would.
     for attempt in range(STREAM_RETRY_ATTEMPTS):
         try:
-            ds = load_dataset(
+            ds = _load_dataset_with_timeout(
                 spec.hf_dataset, spec.hf_config, split=spec.split,
                 streaming=True, token=hf_token if spec.gated else None,
             )
