@@ -105,26 +105,55 @@ python scripts/17_audio_summary.py
 
 ## 2 · Phase-1 corpus + preprocessing
 
+**Recommended — one command, local (e.g. your Mac), pipelined + continuous background
+upload:**
+```bash
+pip install datasets soundfile huggingface_hub
+export HF_TOKEN=hf_...   # WRITE access — only needed for the upload, not the downloads
+
+python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --dry-run
+python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data
+```
+Downloads every language+source concurrently; the moment a language's downloads finish,
+it's immediately encoded + frame-built while the others keep downloading in the
+background; the moment a language's frames are built, it's immediately uploaded to HF in
+the background too — nothing waits for everything else. Fully resumable (Ctrl+C any
+time). See [Phase-1 corpus](/commands/phase1-corpus) for the exact source list.
+
+<Accordion title="Or the older step-by-step way (single-threaded, no HF upload)">
 ```bash
 pip install datasets soundfile
-# no HF_TOKEN needed — every default source is public/ungated (Common Voice was removed
-# from Hugging Face and dropped from this mix, see /commands/phase1-corpus)
+# no HF_TOKEN needed — every default source is public/ungated
 
-# fetch the real, verified free corpus (streamed, stops per-source at target hours):
 python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml --dry-run
 python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml
 
-# encode + build frames, per language:
 for lang in en hi gu; do
   python scripts/00_encode_audio.py --config configs/data_gen.yaml --wav-dir "data/phase1_raw/$lang" --out-dir data/encoded
   python scripts/P1_02_build_frames.py --lang "$lang"
 done
+```
+</Accordion>
 
-# Phase-2 (synthetic scenario audio):
+```bash
+# Phase-2 (synthetic scenario audio) — same either way:
 python scripts/00_encode_audio.py --config configs/data_gen.yaml --audio-dir data/audio --out-dir data/encoded
 python scripts/04_build_frames.py --in data/scenarios/scenarios_all.jsonl --frames-out data/frames/frames_all.jsonl
 ```
-See [Phase-1 corpus](/commands/phase1-corpus) for the exact source list and why each is chosen.
+
+**On the training machine (e.g. Kaggle) — fetch everything already-encoded/framed:**
+```bash
+pip install huggingface_hub
+python scripts/19_fetch_training_data.py \
+    --phase1-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data \
+    --phase2-repo <your-hf-username>/Thinkspark-v2-270m-training-data
+```
+Phase-1 arrives ready to train, no local encode/frame-build needed. Phase-2 arrives as
+raw audio + full scenario text (uploading pre-encoded Phase-2 data isn't done — encode
+locally, it's fast and free): run the Phase-2 `00_encode_audio.py` / `04_build_frames.py`
+commands above once it lands.
 
 ## 3 · Training
 
@@ -178,8 +207,10 @@ and executed piece by piece, not blindly piped through in one sitting.
 | `scripts/11_monitor.py` | data-gen | live dashboard: cost, latency, unit-eval, pass/fail, ETA |
 | `scripts/12_build_report.py` | data-gen | HTML chart report — actual vs. target, cumulative spend |
 | `scripts/10_export_costs.py` | data-gen | CSV cost export from the SQLite log |
-| `scripts/P1_01_fetch_corpus.py` | phase1-corpus | streams LibriSpeech/Kathbath/Shrutilipi/FLEURS/IndicTTS |
+| `scripts/P1_00_pipeline.py` | phase1-corpus | recommended: concurrent download→encode→frames→HF-upload pipeline |
+| `scripts/P1_01_fetch_corpus.py` | phase1-corpus | single-source-at-a-time fetch (no upload); streams LibriSpeech/Kathbath/Shrutilipi/FLEURS/IndicTTS |
 | `scripts/P1_02_build_frames.py` | phase1-corpus | manifest + Mimi shards → Phase-1 frame records |
+| `scripts/19_fetch_training_data.py` | publish | Kaggle-side: fetch Phase-1 + Phase-2 training data from HF |
 | `scripts/00_encode_audio.py` | preprocessing | wav → Mimi cb0 + energy + f0 |
 | `scripts/04_build_frames.py` | preprocessing | scenarios + timestamps → per-frame labels (Phase 2) |
 | `scripts/06_train_phase1.py` | training | modality alignment (LoRA) |
@@ -189,7 +220,7 @@ and executed piece by piece, not blindly piped through in one sitting.
 | `scripts/14_cleanup_corrupt_audio.py` | data-gen | scan + remove corrupt/empty rendered audio |
 | `scripts/17_audio_summary.py` | data-gen | read-only: real audio-hours on disk across short/extended/long |
 | `scripts/18_render_all.sh` | data-gen | render the full consolidated corpus unattended, resumable |
-| `scripts/13_upload_hf.py` | publish | uploads corpus to HF, Dataset-Viewer parquet, resumable |
+| `scripts/13_upload_hf.py` | publish | uploads Phase-2 corpus to HF (audio + full scenarios.jsonl + Dataset-Viewer parquet), resumable |
 
 ## Config files
 

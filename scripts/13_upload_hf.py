@@ -14,7 +14,14 @@ What gets uploaded:
                                             use only — see thinkspark.tts_soniox; never
                                             needed at inference)
     data/train-*.parquet                   Dataset Viewer source: audio (Audio feature)
-                                            + user_text + full scenario metadata
+                                            + user_text + a few flat metadata columns —
+                                            browsable, NOT enough on its own to rebuild
+                                            training frames (no `target`/`event_char`)
+    scenarios/scenarios_all.jsonl          the RAW scenario file, full schema (target
+                                            control-flag timeline, event_char, everything)
+                                            — this is what makes the repo actually
+                                            self-sufficient for training reconstruction
+                                            elsewhere; see scripts/19_fetch_training_data.py
     metadata.jsonl / metadata.csv          AudioFolder-style side index
     README.md                              dataset card (Viewer config, column docs)
 
@@ -43,10 +50,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import random
 import tempfile
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +61,9 @@ ROOT = setup()
 
 from thinkspark.config import DataGenConfig, env
 from thinkspark.db import RunDB
+from thinkspark.hf_upload import (
+    create_commit_with_backoff, ensure_repo, log, pack_by_file_count, sleep_with_jitter, utc_now,
+)
 
 # No safe default namespace to guess — always pass --repo explicitly (your own HF
 # username, e.g. "anuj-inavlabs/Thinkspark-v2-270m-training-data", unless you're
@@ -63,14 +71,6 @@ from thinkspark.db import RunDB
 DEFAULT_REPO = None
 ROWS_PER_PARQUET_SHARD = 10_000
 HF_DIR_SHARD_SIZE = 1000    # HF rejects >10k files per directory; shard well under that
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def log(msg: str) -> None:
-    print(f"[{utc_now()}] {msg}", flush=True)
 
 
 def _shard_dir(scenario_id: str) -> str:
@@ -142,93 +142,9 @@ def pending_rows(
 
 def pack_commits(pending: list[dict], *, files_per_commit: int) -> list[list[dict]]:
     """Greedy-pack rows (2 files each: wav + timestamps json) into commits of up to
-    `files_per_commit` files."""
-    commits: list[list[dict]] = []
-    cur: list[dict] = []
-    cur_files = 0
-    for row in pending:
-        row_files = 2
-        if cur and cur_files + row_files > files_per_commit:
-            commits.append(cur)
-            cur, cur_files = [], 0
-        cur.append(row)
-        cur_files += row_files
-    if cur:
-        commits.append(cur)
-    return commits
-
-
-def is_rate_limit_error(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    return any(n in msg for n in ("429", "rate limit", "ratelimit", "too many requests", "quota", "throttl"))
-
-
-def sleep_with_jitter(seconds: float) -> None:
-    if seconds <= 0:
-        return
-    jitter = seconds * 0.15 * (random.random() * 2 - 1)
-    time.sleep(max(0.5, seconds + jitter))
-
-
-def create_commit_with_backoff(api, *, repo: str, operations: list, commit_message: str,
-                               max_retries: int, base_backoff: float, max_backoff: float) -> None:
-    attempt = 0
-    backoff = base_backoff
-    while True:
-        try:
-            api.create_commit(repo_id=repo, repo_type="dataset",
-                              operations=operations, commit_message=commit_message)
-            return
-        except Exception as exc:
-            attempt += 1
-            if attempt > max_retries:
-                raise
-            if is_rate_limit_error(exc):
-                wait = min(max_backoff, backoff)
-                log(f"rate-limited ({type(exc).__name__}): sleeping {wait:.1f}s "
-                   f"(attempt {attempt}/{max_retries})")
-                sleep_with_jitter(wait)
-                backoff = min(max_backoff, backoff * 2.0)
-                continue
-            msg = str(exc).lower()
-            transient = any(t in msg for t in
-                           ("timeout", "temporarily", "connection", "reset", "502", "503", "504"))
-            if transient:
-                wait = min(max_backoff, backoff)
-                log(f"transient error ({type(exc).__name__}): sleeping {wait:.1f}s "
-                   f"(attempt {attempt}/{max_retries}) — {exc}")
-                sleep_with_jitter(wait)
-                backoff = min(max_backoff, backoff * 1.8)
-                continue
-            raise
-
-
-def ensure_repo(api, repo: str, private: bool) -> None:
-    try:
-        api.create_repo(repo_id=repo, repo_type="dataset", private=private, exist_ok=True)
-    except Exception as exc:
-        msg = str(exc).lower()
-        # 401 = the token itself is invalid/expired/wrong-scope. 403 here is a DIFFERENT
-        # problem the generic message used to conflate with 401: the token is fine, but
-        # its account has no repo-create rights in `repo`'s namespace (a personal write
-        # token doesn't grant rights in an org you're not a member of, or aren't a member
-        # with the right role in). Distinguish them — the fix is not the same.
-        if "401" in msg or "unauthorized" in msg or "invalid user token" in msg:
-            raise RuntimeError(
-                "HF token rejected (401) — the token itself is invalid/expired/read-only. "
-                "Set HF_TOKEN=hf_... with WRITE access (https://huggingface.co/settings/tokens)."
-            ) from exc
-        if "403" in msg and ("rights" in msg or "namespace" in msg or "forbidden" in msg):
-            namespace = repo.split("/", 1)[0] if "/" in repo else repo
-            raise RuntimeError(
-                f"HF rejected repo creation (403) — your token IS valid, but your "
-                f"account has no repo-create rights under the '{namespace}' namespace. "
-                f"If '{namespace}' is an org, you need to actually be a member with "
-                f"write/create rights there. Easiest fix: use your own username instead, "
-                f"e.g. --repo <your-hf-username>/{repo.split('/', 1)[-1] if '/' in repo else repo}."
-            ) from exc
-        if "already" not in msg and "409" not in msg and "exist" not in msg:
-            raise
+    `files_per_commit` files. Thin wrapper over the generic packer in thinkspark.hf_upload,
+    shared with scripts/P1_00_pipeline.py."""
+    return pack_by_file_count(pending, files_per_item=2, files_per_commit=files_per_commit)
 
 
 # --------------------------------------------------------------------------- #
@@ -488,7 +404,17 @@ def run(args: argparse.Namespace) -> int:
         readme_path.write_text(readme, encoding="utf-8")
         ops.append(CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=str(readme_path)))
 
-        log(f"  uploading playable audio+text parquet + README -> {args.repo}…")
+        # The parquet/metadata above are Viewer-oriented (audio+text+a few flat fields) —
+        # they deliberately DON'T carry `target` (the control-flag timeline) or
+        # `event_char`, both of which scripts/04_build_frames.py needs to build real
+        # training frames. Upload the raw scenarios file too so this repo is actually
+        # SELF-SUFFICIENT for full training reconstruction on another machine (Kaggle),
+        # not just browsable — see scripts/19_fetch_training_data.py, which reads this
+        # verbatim into data/scenarios/scenarios_all.jsonl.
+        ops.append(CommitOperationAdd(path_in_repo="scenarios/scenarios_all.jsonl",
+                                      path_or_fileobj=str(scenarios_path)))
+
+        log(f"  uploading playable audio+text parquet + full scenarios.jsonl + README -> {args.repo}…")
         create_commit_with_backoff(
             api, repo=args.repo, operations=ops,
             commit_message=f"add Dataset Viewer parquet ({len(viewer_rows)} paired rows)",

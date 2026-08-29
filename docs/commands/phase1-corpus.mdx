@@ -97,24 +97,72 @@ more accent diversity and have the session budget.
 
 ## Run it
 
+**Recommended: `scripts/P1_00_pipeline.py`** — runs entirely locally (e.g. your Mac, no
+Kaggle session needed for this stage), downloads every language+source concurrently,
+and pipelines the rest: the moment a language finishes downloading it's immediately
+encoded + frame-built (while the other languages keep downloading), and the moment its
+frames are built it's immediately uploaded to Hugging Face in the background:
+```bash
+pip install datasets soundfile huggingface_hub
+export HF_TOKEN=hf_...   # WRITE access — only needed for the upload step, not downloads
+
+python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --dry-run
+python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data
+```
+Every stage logs its own timestamped, tagged lines (`[DOWNLOAD]`, `[ENCODE]`,
+`[FRAMES]`, `[UPLOAD]`, plus a periodic `[STATUS]` summary across all of them) — safe to
+watch while several stages run at once. Fully resumable: Ctrl+C any time, re-run the
+same command, every stage (download via the manifest, encode via existing `.npz`,
+upload via a `hf_sync` SQLite table) picks up exactly where it left off. `--no-upload`
+runs it purely locally. Run `--no-upload` first if you just want the corpus without
+publishing it anywhere.
+
+Local-only, no upload: `python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml --no-upload`
+
+<Accordion title="Or the single-source-at-a-time CLI (no concurrency, no HF upload)">
 ```bash
 pip install datasets soundfile
 
 # see the plan without downloading anything:
 python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml --dry-run
 
-# fetch (resumable — safe to stop and re-run across as many Kaggle sessions as you need):
+# fetch (resumable — safe to stop and re-run across as many sessions as you need):
 python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml
 
 # just one language:
 python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml --lang hi
 ```
+Then encode + build frames yourself, per language:
+```bash
+for lang in en hi gu; do
+  python scripts/00_encode_audio.py --wav-dir "data/phase1_raw/$lang" --out-dir data/encoded
+  python scripts/P1_02_build_frames.py --lang "$lang"
+done
+```
+Both entry points share the exact same fetch logic (`thinkspark.phase1_corpus.fetch_source`)
+— identical results either way, this one is just simpler/slower for a quick one-off fetch.
+</Accordion>
 
 <Note>
-No `HF_TOKEN` needed — every source in the default config is public and ungated (see
-the Common Voice note above for why that changed). Only set `HF_TOKEN` if you add back
-a gated source yourself (`gated: true` in a `sources:` entry).
+No `HF_TOKEN` needed to download — every source in the default config is public and
+ungated (see the Common Voice note above for why that changed). `HF_TOKEN` (with WRITE
+access) is only needed for `P1_00_pipeline.py`'s upload step, or if you add back a gated
+source yourself (`gated: true` in a `sources:` entry).
 </Note>
+
+## Fetching this data onto a training machine (Kaggle)
+
+Once uploaded, pull it straight into Kaggle's local `data/` layout — no re-encoding:
+```bash
+pip install huggingface_hub
+python scripts/19_fetch_training_data.py \
+    --phase1-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data
+```
+Lands as `data/encoded/*.npz` + `data/frames_phase1/*.jsonl`, ready to train
+(`scripts/06_train_phase1.py`) immediately. See [Full cheatsheet](/commands/cheatsheet)
+for fetching Phase-2 in the same command.
 
 ## How it stays bounded on Kaggle
 

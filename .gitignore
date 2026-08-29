@@ -13,6 +13,10 @@ reports/
 data/thinkspark_runs.db
 data/thinkspark_runs.db-wal
 data/thinkspark_runs.db-shm
+data/thinkspark_phase1.db
+data/thinkspark_phase1.db-wal
+data/thinkspark_phase1.db-shm
+data/.hf_fetch_tmp/
 
 # generated data (keep the committed samples + .gitkeep)
 # short + extended + long were originally three separate corpora, generated into their

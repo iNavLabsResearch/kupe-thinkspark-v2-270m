@@ -392,16 +392,52 @@ Scoped deliberately — leaves `llm_calls`/`unit_evals`/`scenario_registry` (sce
 instead.
 
 ### 4 · Get the Phase-1 free corpus (Section 7)
+
+**Recommended — run this locally (e.g. your Mac), not on Kaggle:** one command
+downloads every language+source concurrently, encodes + builds frames for each language
+the instant its downloads finish (while the others keep downloading), and continuously
+uploads finished languages to Hugging Face in the background — all with live, tagged,
+timestamped logs across every stage:
+```bash
+pip install datasets soundfile huggingface_hub
+export HF_TOKEN=hf_...   # WRITE access — only for the upload step, downloads need none
+
+python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data --dry-run
+python scripts/P1_00_pipeline.py --config configs/phase1_corpus.yaml \
+    --hf-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data
+```
+Fully resumable (Ctrl+C, re-run, every stage picks up exactly where it left off — the
+manifest for downloads, existing `.npz` for encoding, a `hf_sync` SQLite table for
+uploads). `--no-upload` runs it purely locally, no HF repo needed. Then, on your
+training machine (Kaggle), fetch the ready-to-train result in one command — see
+[Fetching training data onto Kaggle](#fetching-training-data-onto-kaggle-phase-1--phase-2)
+below.
+
+<details>
+<summary>Or the older, single-threaded, no-upload CLI (<code>scripts/P1_01_fetch_corpus.py</code>)</summary>
+
 ```bash
 pip install datasets soundfile
 
 python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml --dry-run  # see the plan first
 python scripts/P1_01_fetch_corpus.py --config configs/phase1_corpus.yaml            # fetch (resumable)
 ```
+Same underlying fetch logic (`thinkspark.phase1_corpus.fetch_source`), just one source
+at a time and no HF upload — simpler for a quick one-off local fetch. Then encode +
+build frames yourself, per language:
+```bash
+for lang in en hi gu; do
+  python scripts/00_encode_audio.py --wav-dir "data/phase1_raw/$lang" --out-dir data/encoded
+  python scripts/P1_02_build_frames.py --lang "$lang"
+done
+```
+</details>
+
 Streams (never fully downloads) the real, verified sources — per language, stops the
-moment its target hours are reached, so disk/bandwidth stay bounded on Kaggle regardless
-of how huge the upstream dataset is. **No `HF_TOKEN` needed at all** — every source below
-is public/ungated:
+moment its target hours are reached, so disk/bandwidth stay bounded regardless of how
+huge the upstream dataset is. **No `HF_TOKEN` needed to download at all** — every source
+below is public/ungated (only the upload step needs one):
 
 <details>
 <summary><b>Common Voice was removed from this mix on 2026-08-29 — Mozilla pulled it off Hugging Face entirely</b></summary>
@@ -517,9 +553,45 @@ progress/rate/ETA logged every commit — same bulk-upload pattern as `kupe-tts`
 audio might be corrupt). On top of the raw files it also builds a **Dataset Viewer**
 parquet — a real `Audio` feature column paired with `user_text` and every scenario field
 (behaviour, language, domain, gender, prosody) — so the Hub UI shows a playable audio
-player next to the transcript for every row, plus a dataset card README. Resumable via a
-`hf_sync` table in the same SQLite DB (`thinkspark.db`), so re-running only uploads what's
-still pending. Never deletes local files.
+player next to the transcript for every row, plus a dataset card README. **Also uploads
+the raw `scenarios/scenarios_all.jsonl`** (full schema — the parquet alone is Viewer-
+oriented and doesn't carry `target`/`event_char`, so it can't rebuild real training
+frames on its own; the raw file is what makes the repo actually self-sufficient for
+training reconstruction elsewhere). Resumable via a `hf_sync` table in the same SQLite DB
+(`thinkspark.db`), so re-running only uploads what's still pending. Never deletes local
+files.
+
+### Fetching training data onto Kaggle (Phase 1 + Phase 2)
+
+On your training machine, pull both phases straight into the local `data/` layout the
+training scripts expect — no re-encoding for Phase 1, no reconstruction guesswork for
+Phase 2:
+```bash
+pip install huggingface_hub
+
+python scripts/19_fetch_training_data.py \
+    --phase1-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data \
+    --phase2-repo <your-hf-username>/Thinkspark-v2-270m-training-data --dry-run
+python scripts/19_fetch_training_data.py \
+    --phase1-repo <your-hf-username>/kupe-thinkspark-270m-phase1-data \
+    --phase2-repo <your-hf-username>/Thinkspark-v2-270m-training-data
+```
+- **Phase 1** lands as `data/encoded/*.npz` + `data/frames_phase1/*.jsonl` — already
+  encoded and frame-built by `scripts/P1_00_pipeline.py`, ready to train immediately:
+  `python scripts/06_train_phase1.py --config configs/train_phase1.yaml --frames "data/frames_phase1/*.jsonl"`.
+- **Phase 2** lands as `data/scenarios/scenarios_all.jsonl` (the real full-schema file,
+  not the Viewer parquet) + `data/audio/*.wav` + `data/audio/*.words.json`. Pre-encoded
+  Phase-2 data isn't uploaded (only raw audio + text) — encode + build frames locally
+  once, it's fast and free:
+  ```bash
+  python scripts/00_encode_audio.py --audio-dir data/audio --out-dir data/encoded
+  python scripts/04_build_frames.py --in data/scenarios/scenarios_all.jsonl --frames-out data/frames/frames_all.jsonl
+  ```
+
+Either `--phase1-repo` or `--phase2-repo` can be omitted to fetch just the one you need.
+Files are **moved** (not copied) out of the download snapshot into their final flattened
+locations, so this never doubles your disk usage — resumable, an existing local file is
+left alone and only what's missing gets fetched.
 
 ---
 
@@ -538,8 +610,9 @@ the reply is already (partly) ready ⇒ perceived reply `≈ referee(≤40) + TT
 ## Directory layout
 
 ```
-thinkspark/            the package (one module per pipeline stage; db.py = SQLite log)
-scripts/               00–15 + P1_01/P1_02 CLI stages + make_samples.py + run_all.sh
+thinkspark/            the package (one module per pipeline stage; db.py = SQLite log;
+                        phase1_corpus.py = shared fetch logic; hf_upload.py = shared HF helpers)
+scripts/               00–19 + P1_00/P1_01/P1_02 CLI stages + make_samples.py + run_all.sh
 configs/               data_gen.yaml · phase1_corpus.yaml · train_phase1.yaml · train_phase2.yaml
 data/samples/          committed, offline sample scenarios + frame records (read its README)
 data/voice_refs/        your own reference clips (read its README) + voice_profiles.json (cloned IDs)
@@ -547,6 +620,7 @@ data/plan/              auto-built balanced job plan (Section 8.1-8.3; git-ignor
 data/phase1_raw/         fetched free-audio wavs + manifest.jsonl (Section 7; git-ignored)
 data/{scenarios,audio,encoded,frames,frames_phase1}/   generated artifacts (git-ignored)
 data/thinkspark_runs.db  SQLite audit/cost log for every LLM + TTS call (git-ignored)
+data/thinkspark_phase1.db  Phase-1 pipeline's HF-upload sync log (scripts/P1_00_pipeline.py; git-ignored)
 reports/cost_report.csv        flat CSV export of the DB (scripts/10_export_costs.py)
 reports/generation_report.html  chart report — cost, progress, unit-eval (scripts/12_build_report.py)
 artifacts/             checkpoints (git-ignored)

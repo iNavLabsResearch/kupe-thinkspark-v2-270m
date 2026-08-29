@@ -1,0 +1,416 @@
+"""
+Phase-1 free-audio corpus config + streaming fetch — shared by scripts/P1_01_fetch_corpus.py
+(single-source-at-a-time CLI) and scripts/P1_00_pipeline.py (concurrent download/encode/
+upload orchestrator). Moved here so both entry points share the exact same, hardened
+fetch logic rather than risking it drifting between two copies.
+
+See scripts/P1_01_fetch_corpus.py's module docstring for the full source list and the
+Common Voice removal story; configs/phase1_corpus.yaml for the per-language source mix.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+import yaml
+
+# Column-name candidates tried, in order, when a source doesn't set an explicit
+# text_col/gender_col override — different HF datasets name these differently and we'd
+# rather auto-detect than hard-crash on a guess that turns out wrong for one source.
+_TEXT_COL_CANDIDATES = ["sentence", "text", "transcription", "transcript", "normalized_text"]
+_GENDER_COL_CANDIDATES = ["gender", "sex", "speaker_gender"]
+
+
+# --------------------------------------------------------------------------- #
+@dataclass
+class SourceSpec:
+    id: str
+    hf_dataset: str
+    hf_config: str | None
+    split: str
+    gated: bool = False
+    weight: float = 1.0
+    note: str = ""
+    audio_col: str | None = None    # override; else auto-detect the Audio-typed column
+    text_col: str | None = None     # override; else try _TEXT_COL_CANDIDATES
+    gender_col: str | None = None   # override; else try _GENDER_COL_CANDIDATES
+
+    @staticmethod
+    def from_dict(d: dict) -> "SourceSpec":
+        known = {f for f in SourceSpec.__dataclass_fields__}
+        return SourceSpec(**{k: v for k, v in d.items() if k in known})
+
+
+@dataclass
+class Phase1CorpusConfig:
+    target_hours: dict[str, float]
+    sources: dict[str, list[SourceSpec]]
+    gender_balance: bool = True
+    sample_rate: int = 24000
+    min_clip_seconds: float = 1.5
+    max_clip_seconds: float = 20.0
+
+    @staticmethod
+    def from_yaml(path: str) -> "Phase1CorpusConfig":
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        sources = {
+            lang: [SourceSpec.from_dict(s) for s in specs]
+            for lang, specs in (raw.get("sources") or {}).items()
+        }
+        return Phase1CorpusConfig(
+            target_hours=raw.get("target_hours", {}),
+            sources=sources,
+            gender_balance=bool(raw.get("gender_balance", True)),
+            sample_rate=int(raw.get("sample_rate", 24000)),
+            min_clip_seconds=float(raw.get("min_clip_seconds", 1.5)),
+            max_clip_seconds=float(raw.get("max_clip_seconds", 20.0)),
+        )
+
+
+# --------------------------------------------------------------------------- #
+def manifest_path(out_dir: Path) -> Path:
+    return out_dir / "manifest.jsonl"
+
+
+def existing_written(manifest_file: Path) -> dict[tuple[str, str], dict]:
+    """
+    {(lang, source_id): {"count": N, "hours": H, "female": F, "male": M}} from what's
+    already on disk — the resume checkpoint. File-based, same pattern as script 02.
+    """
+    stats: dict[tuple[str, str], dict] = {}
+    if not manifest_file.exists():
+        return stats
+    for line in manifest_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        key = (rec.get("lang"), rec.get("source"))
+        s = stats.setdefault(key, {"count": 0, "hours": 0.0, "female": 0, "male": 0})
+        s["count"] += 1
+        s["hours"] += rec.get("duration_s", 0.0) / 3600.0
+        g = rec.get("gender")
+        if g in ("female", "male"):
+            s[g] += 1
+    return stats
+
+
+def clip_id(lang: str, source_id: str, row_index: int) -> str:
+    raw = f"{lang}|{source_id}|{row_index}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def pick_column(candidates: list[str], feature_names: list[str]) -> str | None:
+    for c in candidates:
+        if c in feature_names:
+            return c
+    return None
+
+
+def relative_or_absolute(path: Path, root: Path) -> str:
+    """Store paths relative to `root` when possible (portable manifest/frame records —
+    the whole point is these are meant to be re-downloaded onto a DIFFERENT machine and
+    still resolve correctly); fall back to absolute if `path` isn't under `root`."""
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def detect_audio_column(row: dict) -> str | None:
+    for k, v in row.items():
+        if isinstance(v, dict) and "array" in v and "sampling_rate" in v:
+            return k
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Transient-network resilience for HF streaming (Kaggle's network layer can drop a
+# parquet GET mid-stream — real observed failure: '[Errno 9] Bad file descriptor' while
+# resolving a shard, which also corrupts whatever `row` was mid-flight, making audio/
+# text column auto-detection fail on that ONE row even though the dataset is fine). Two
+# layers of defense, matching the retry-classification pattern already used in
+# thinkspark.tts_soniox / thinkspark.hf_upload:
+#   1. column auto-detection tolerates a few bad/incomplete rows before giving up — a
+#      truly missing column fails EVERY row, a transient glitch fails only one.
+#   2. the whole per-source stream is retried (fresh `load_dataset` call) a few times if
+#      the iterator itself dies mid-stream, instead of crashing the whole run.
+#
+# Phrase markers (safe as plain substrings — no false-positive risk).
+_TRANSIENT_PHRASES = ("bad file descriptor", "errno 9", "connection", "timeout",
+                     "temporarily", "reset", "broken pipe")
+# Bare HTTP status codes need a WORD-BOUNDARY regex, not a substring check — a real
+# stack trace's line number (e.g. "line 1503") contains "503" as a substring and would
+# otherwise misfire as a transient network error. Confirmed real bug: a permanent
+# torchcodec/FFmpeg load failure was retried 4 times uselessly because its traceback
+# happened to include a "...1503..." line number.
+_TRANSIENT_STATUS_RE = re.compile(r"\b(502|503|504)\b")
+COLUMN_DETECT_ROW_BUDGET = 5     # rows to try before concluding a column truly doesn't exist
+STREAM_RETRY_ATTEMPTS = 4        # fresh-iterator retries on a transient mid-stream failure
+
+
+def looks_transient(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _TRANSIENT_PHRASES) or bool(_TRANSIENT_STATUS_RE.search(msg))
+
+
+# --------------------------------------------------------------------------- #
+def fetch_source(
+    cfg: Phase1CorpusConfig,
+    lang: str,
+    spec: SourceSpec,
+    out_dir: Path,
+    root: Path,
+    manifest_fh,
+    already: dict,
+    hf_token: str | None,
+    dry_run: bool,
+    log_fn: Callable[[str], None] = print,
+) -> dict:
+    """
+    Stream one source, writing wavs + manifest rows until this source's share of
+    target_hours is reached (or the stream runs out). Returns a small result summary.
+
+    `manifest_fh` must be safe to call `.write()`/`.flush()` on from whatever thread
+    calls this (the CLI passes a plain file handle from a single-threaded run;
+    scripts/P1_00_pipeline.py passes a lock-guarded wrapper since multiple sources can
+    fetch concurrently). `log_fn` receives one-line progress/retry messages — the CLI
+    defaults to plain `print`; the pipeline passes a tagged, thread-safe logger.
+    """
+    target_h = cfg.target_hours.get(lang, 0.0) * spec.weight
+    have_h = already.get((lang, spec.id), {}).get("hours", 0.0)
+    have_n = already.get((lang, spec.id), {}).get("count", 0)
+
+    if have_h >= target_h:
+        return {"lang": lang, "source": spec.id, "status": "already_done",
+               "have_hours": have_h, "target_hours": target_h}
+
+    if dry_run:
+        return {"lang": lang, "source": spec.id, "status": "dry_run",
+               "have_hours": have_h, "target_hours": target_h,
+               "remaining_hours": max(0.0, target_h - have_h),
+               "hf_dataset": spec.hf_dataset, "hf_config": spec.hf_config,
+               "gated": spec.gated}
+
+    try:
+        from datasets import Audio, load_dataset
+    except ImportError:
+        raise SystemExit("`datasets` not installed. `pip install datasets soundfile`.")
+
+    try:
+        import soundfile as sf
+    except ImportError:
+        raise SystemExit("`soundfile` not installed. `pip install soundfile`.")
+
+    # FLAT per-language dir (not lang/source/) — scripts/00_encode_audio.py globs
+    # "*.wav" non-recursively, so this must match exactly what it expects. The source
+    # id is folded into the filename instead, so provenance is still visible.
+    lang_dir = out_dir / lang
+    lang_dir.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    audio_col = spec.audio_col
+    text_col = spec.text_col
+    gender_col = spec.gender_col
+    audio_col_fail_rows = 0    # rows where column auto-detect failed — see COLUMN_DETECT_ROW_BUDGET
+    text_col_fail_rows = 0
+    last_err: Exception | None = None
+
+    # Retries the WHOLE stream from a fresh `load_dataset` call if it dies mid-iteration
+    # on a transient error (real observed case: '[Errno 9] Bad file descriptor' from a
+    # Kaggle network blip while GETting a parquet shard) — restarting is safe because the
+    # skipped_for_resume counter below re-skips already-written rows from the top, same
+    # as a normal script restart would.
+    for attempt in range(STREAM_RETRY_ATTEMPTS):
+        try:
+            ds = load_dataset(
+                spec.hf_dataset, spec.hf_config, split=spec.split,
+                streaming=True, token=hf_token if spec.gated else None,
+            )
+        except Exception as e:
+            msg = str(e)
+            if spec.gated and ("gated" in msg.lower() or "401" in msg or "403" in msg):
+                raise SystemExit(
+                    f"'{spec.hf_dataset}' is gated. Visit "
+                    f"https://huggingface.co/datasets/{spec.hf_dataset}, log in, and click "
+                    f"'Agree and access repository' — then re-run with HF_TOKEN set."
+                )
+            if looks_transient(e) and attempt < STREAM_RETRY_ATTEMPTS - 1:
+                wait = 2.0 * (attempt + 1)
+                log_fn(f"transient error opening stream (attempt {attempt + 1}/"
+                      f"{STREAM_RETRY_ATTEMPTS}): {e} — retrying in {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            raise SystemExit(f"failed to open {spec.hf_dataset}/{spec.hf_config}: {e}")
+
+        ds = ds.cast_column(spec.audio_col or "audio", Audio(sampling_rate=cfg.sample_rate))
+        # `written` (not just `have_n`) must be included here: a fresh stream restarts
+        # from row 0, so it must also re-skip whatever THIS call already wrote in an
+        # earlier attempt before the failure — otherwise a mid-stream restart duplicates
+        # those rows under new clip_ids. Relies on the streaming order being stable
+        # across repeated `load_dataset` calls for the same split (true for HF's default
+        # unshuffled parquet-backed streaming).
+        skipped_for_resume = have_n + written
+        row_index = -1
+
+        try:
+            for row in ds:
+                row_index += 1
+
+                if audio_col is None:
+                    detected = spec.audio_col or detect_audio_column(row)
+                    if detected is None:
+                        audio_col_fail_rows += 1
+                        if audio_col_fail_rows >= COLUMN_DETECT_ROW_BUDGET:
+                            raise SystemExit(
+                                f"couldn't find an audio column in {spec.hf_dataset}/"
+                                f"{spec.hf_config} after inspecting "
+                                f"{COLUMN_DETECT_ROW_BUDGET} rows — set `audio_col:` "
+                                f"explicitly in configs/phase1_corpus.yaml"
+                            )
+                        continue   # might be one transiently-corrupted row — try the next
+                    audio_col = detected
+
+                if text_col is None:
+                    detected = spec.text_col or pick_column(_TEXT_COL_CANDIDATES, list(row.keys()))
+                    if detected is None:
+                        text_col_fail_rows += 1
+                        if text_col_fail_rows >= COLUMN_DETECT_ROW_BUDGET:
+                            raise SystemExit(
+                                f"couldn't find a transcript column in {spec.hf_dataset}/"
+                                f"{spec.hf_config} after inspecting "
+                                f"{COLUMN_DETECT_ROW_BUDGET} rows (tried "
+                                f"{_TEXT_COL_CANDIDATES}) — set `text_col:` explicitly in "
+                                f"configs/phase1_corpus.yaml"
+                            )
+                        continue
+                    text_col = detected
+
+                if gender_col is None and cfg.gender_balance:
+                    gender_col = spec.gender_col or pick_column(_GENDER_COL_CANDIDATES, list(row.keys()))
+                    # may legitimately stay None (many sources don't carry gender) — fine
+
+                if skipped_for_resume > 0:
+                    skipped_for_resume -= 1
+                    continue  # already saved from a previous run/attempt; keep streaming
+
+                try:
+                    audio = row.get(audio_col)
+                    if not audio or "array" not in audio:
+                        continue
+                    arr, sr = audio["array"], audio["sampling_rate"]
+                    duration_s = len(arr) / float(sr)
+                    if duration_s < cfg.min_clip_seconds or duration_s > cfg.max_clip_seconds:
+                        continue
+
+                    transcript = str(row.get(text_col, "") or "").strip()
+                    if not transcript:
+                        continue
+
+                    gender = None
+                    if gender_col:
+                        raw_g = str(row.get(gender_col, "") or "").lower()
+                        if raw_g.startswith("f"):
+                            gender = "female"
+                        elif raw_g.startswith("m"):
+                            gender = "male"
+
+                    cid = clip_id(lang, spec.id, row_index)
+                    wav_path = lang_dir / f"{spec.id}_{cid}.wav"
+                    sf.write(str(wav_path), arr, sr)
+                except Exception as e:
+                    # one corrupted row (same class of transient glitch as a dead stream,
+                    # just caught at the single-row level) — skip it, keep going, don't
+                    # let it take down the whole multi-hour fetch
+                    if looks_transient(e):
+                        continue
+                    raise
+
+                manifest_fh.write(json.dumps({
+                    "id": cid, "lang": lang, "source": spec.id,
+                    "wav_path": relative_or_absolute(wav_path, root),
+                    "transcript": transcript, "gender": gender,
+                    "duration_s": round(duration_s, 3),
+                }, ensure_ascii=False) + "\n")
+                if hasattr(manifest_fh, "flush"):
+                    manifest_fh.flush()
+
+                written += 1
+                have_h += duration_s / 3600.0
+                if have_h >= target_h:
+                    break
+
+            break   # completed (or hit target) without a fatal stream error — done retrying
+
+        except SystemExit:
+            raise   # a real "column doesn't exist" / gated / etc. — not retryable, surface it
+        except Exception as e:
+            last_err = e
+            if looks_transient(e) and attempt < STREAM_RETRY_ATTEMPTS - 1:
+                wait = 2.0 * (attempt + 1)
+                log_fn(f"transient error mid-stream (attempt {attempt + 1}/"
+                      f"{STREAM_RETRY_ATTEMPTS}): {e} — {written} clip(s) written so far, "
+                      f"restarting stream in {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            raise SystemExit(
+                f"fetch failed for {spec.hf_dataset}/{spec.hf_config} after "
+                f"{attempt + 1} attempt(s), {written} clip(s) written before the failure "
+                f"(kept — safe to just re-run, it resumes): {e}"
+            ) from last_err
+
+    return {"lang": lang, "source": spec.id, "status": "ok",
+           "written": written, "have_hours": round(have_h, 3), "target_hours": round(target_h, 3)}
+
+
+# --------------------------------------------------------------------------- #
+# Frame-record building (shared with scripts/P1_02_build_frames.py) — see that
+# script's module docstring for what fields Phase1Loss actually reads.
+def build_frame_record(rec: dict, encoded_path: Path, root: Path) -> dict | None:
+    """
+    `encoded_path` in the returned record is stored ROOT-RELATIVE (e.g.
+    "data/encoded/xyz.npz"), NOT absolute — this is what makes a frames_<lang>.jsonl
+    file portable across machines (generated on your Mac, downloaded and used as-is on
+    Kaggle) as long as the training script is run from the project root, same convention
+    every other path in this project already follows. An earlier version of this
+    function stored the absolute path, which silently only worked on the machine that
+    generated it — fixed here, not just papered over downstream.
+    """
+    if not encoded_path.exists():
+        return None
+    import numpy as np
+
+    from thinkspark import vocab
+
+    d = np.load(encoded_path)
+    T = len(d["cb0"])
+    if T <= 0:
+        return None
+
+    default_flag = vocab.CONTROL_FLAG_TO_ID[vocab.DEFAULT_FLAG]  # LISTEN
+    idle_state = vocab.AGENT_STATE_TO_ID["IDLE"]
+
+    return {
+        "scenario_id": rec["id"],
+        "behaviour": "phase1_free_audio",
+        "language": rec["lang"],
+        "domain": rec["source"],
+        "agent_text": "",
+        "user_text": rec["transcript"],
+        "num_frames": T,
+        "audio_frames": T,
+        "encoded_path": relative_or_absolute(encoded_path, root),
+        "flags": [default_flag] * T,
+        "agent_state": [idle_state] * T,
+        "speaking_mask": [1] * T,
+        "spoken_spans": [],
+    }

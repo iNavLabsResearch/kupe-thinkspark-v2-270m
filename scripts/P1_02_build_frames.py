@@ -9,12 +9,18 @@ reads `flags`/`agent_state` (those are Phase-2-only). So a Phase-1 frame record 
 just enough structure to satisfy the shared record schema:
 
     num_frames     = length of the clip's Mimi cb0 sequence
-    encoded_path   = path to the clip's Mimi .npz (cb0 + energy + f0)
+    encoded_path   = ROOT-RELATIVE path to the clip's Mimi .npz (cb0 + energy + f0) —
+                     NOT absolute, so the same frames_<lang>.jsonl works whether it was
+                     built here or downloaded onto a different machine (e.g. Kaggle),
+                     as long as you run training from the project root
     user_text      = the transcript (this IS the alignment target)
     agent_text     = ""            (no agent side in Phase 1)
     flags          = all LISTEN     (present for schema compatibility; unused by Phase1Loss)
     agent_state    = all IDLE       (same — unused by Phase1Loss)
     speaking_mask  = all 1s         (the whole clip is user speech -> VAP target = "speaking")
+
+The actual record-building logic lives in thinkspark.phase1_corpus.build_frame_record,
+shared with scripts/P1_00_pipeline.py's per-language incremental build.
 
     conda activate llms
     python scripts/P1_02_build_frames.py --lang hi
@@ -31,36 +37,7 @@ from _bootstrap import setup
 
 ROOT = setup()
 
-from thinkspark import vocab
-
-
-def build_record(rec: dict, encoded_path: Path) -> dict | None:
-    if not encoded_path.exists():
-        return None
-    import numpy as np
-    d = np.load(encoded_path)
-    T = len(d["cb0"])
-    if T <= 0:
-        return None
-
-    default_flag = vocab.CONTROL_FLAG_TO_ID[vocab.DEFAULT_FLAG]  # LISTEN
-    idle_state = vocab.AGENT_STATE_TO_ID["IDLE"]
-
-    return {
-        "scenario_id": rec["id"],
-        "behaviour": "phase1_free_audio",
-        "language": rec["lang"],
-        "domain": rec["source"],
-        "agent_text": "",
-        "user_text": rec["transcript"],
-        "num_frames": T,
-        "audio_frames": T,
-        "encoded_path": str(encoded_path),
-        "flags": [default_flag] * T,
-        "agent_state": [idle_state] * T,
-        "speaking_mask": [1] * T,
-        "spoken_spans": [],
-    }
+from thinkspark.phase1_corpus import build_frame_record
 
 
 def main():
@@ -102,7 +79,7 @@ def main():
             for rec in recs:
                 stem = Path(rec["wav_path"]).stem
                 encoded_path = encoded_dir / f"{stem}.npz"
-                frame = build_record(rec, encoded_path)
+                frame = build_frame_record(rec, encoded_path, ROOT)
                 if frame is None:
                     missing_encoding += 1
                     continue
