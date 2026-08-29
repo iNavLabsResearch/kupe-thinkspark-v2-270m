@@ -24,11 +24,15 @@ soundfile>=0.12            # robust wav io (optional; stdlib wave is the fallbac
 datasets>=2.19             # streams Common Voice / Kathbath / Shrutilipi / FLEURS / IndicTTS
 # REQUIRED as of `datasets` 4.x/5.x — real observed failure without it: streaming an
 # Audio-cast column raises "To support decoding audio data, please install 'torchcodec'."
-# immediately on the first row (not a warning, a hard stop). `pip install torchcodec`
-# alone pulls a build matched to whatever `torch` is already installed via PyPI's normal
-# dependency resolution — no separate CUDA-specific package needed for this project's use
-# (CPU-side tensor decode of small clips), even on a GPU box.
-torchcodec>=0.1
+# immediately on the first row (not a warning, a hard stop).
+# PIN to <0.11 — real observed bug, confirmed upstream: torchcodec 0.11.0+ unconditionally
+# requires CUDA 13's libnvrtc.so.13 to even IMPORT, regardless of whether GPU decoding is
+# ever used (https://github.com/ace-step/ACE-Step-1.5/issues/1078) — fails immediately on
+# any box whose actual CUDA runtime is a different major version (very common — e.g. a
+# RunPod GPU pod on CUDA 12.x), with a `libnvrtc.so.13: cannot open shared object file`
+# error. This project only ever needs CPU-side decode of small audio clips — no GPU
+# acceleration benefit either way — so there's no reason to eat that requirement.
+torchcodec>=0.1,<0.11
 
 # ---- data generation --------------------------------------------------------
 openai>=1.40               # scenario + label writer + LLM-judge (any OpenAI-compatible endpoint)
