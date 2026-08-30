@@ -80,6 +80,7 @@ def vap_bce_loss(
 def spoken_ce_loss(
     lm_logits: torch.Tensor,   # [B, L_total, V]
     labels: torch.Tensor,      # [B, L_total]  (-100 where not a spoken target)
+    label_smoothing: float = 0.0,
 ) -> torch.Tensor:
     if (labels != -100).sum() == 0:
         return lm_logits.sum() * 0.0
@@ -90,6 +91,7 @@ def spoken_ce_loss(
         shift_logits.reshape(-1, shift_logits.size(-1)),
         shift_labels.reshape(-1),
         ignore_index=-100,
+        label_smoothing=label_smoothing,
     )
 
 
@@ -97,12 +99,14 @@ def spoken_ce_loss(
 class Phase1Loss(nn.Module):
     """L_P1 = L_align + lambda_vap * L_vap."""
 
-    def __init__(self, lambda_vap: float = 0.3):
+    def __init__(self, lambda_vap: float = 0.3, label_smoothing: float = 0.0):
         super().__init__()
         self.lambda_vap = lambda_vap
+        self.label_smoothing = label_smoothing
 
     def forward(self, out, batch) -> dict[str, torch.Tensor]:
-        l_align = spoken_ce_loss(out.lm_logits, batch["align_labels"])
+        l_align = spoken_ce_loss(out.lm_logits, batch["align_labels"],
+                                 label_smoothing=self.label_smoothing)
         l_vap = vap_bce_loss(out.vap_logits, batch["vap"], batch["audio_mask"])
         total = l_align + self.lambda_vap * l_vap
         return {"loss": total, "align": l_align.detach(), "vap": l_vap.detach(),

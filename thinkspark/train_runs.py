@@ -74,6 +74,7 @@ def wire_run(trainer, cfg, args, *, phase: str, root: Path) -> str:
         raise SystemExit("--resume needs --run-id (which run to resume)")
 
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    trainer.run_id = run_id   # used as the W&B run name (see Trainer._init_wandb)
 
     base_out = Path(cfg.out_dir)
     run_dir = base_out / "runs" / run_id

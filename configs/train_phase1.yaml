@@ -38,3 +38,11 @@ log_every: 20
 save_every: 500
 seed: 1234
 ddp: false                # set true and launch with torchrun --nproc_per_node=2
+
+# eval splits + Weights & Biases logging
+val_frac: 0.02            # 2% held out for validation (logged every eval_every steps)
+test_frac: 0.01           # 1% held out for a single final test eval
+eval_every: 500           # validation cadence (also runs at each epoch end)
+wandb_project: "kupe-thinkspark-270m"   # set to null to disable; needs WANDB_API_KEY in env
+wandb_entity: null        # your W&B team/user (null = default from your login)
+wandb_run_name: null      # null = use the training run-id

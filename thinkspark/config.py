@@ -160,14 +160,26 @@ class TrainConfig:
     # optimisation (Section 9.4)
     optimizer: str = "adamw"
     weight_decay: float = 0.1
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95             # 0.95 (not 0.999) — the LLM-pretraining / Moshi
+                                         # default; steadier on short finetunes than 0.999
+    adam_eps: float = 1e-8
     lr: float = 1e-4                     # Phase-2 default; Phase-1 uses 2e-4
     warmup_ratio: float = 0.03
     batch_size: int = 8
     grad_accum: int = 4                  # effective batch 32-64
     epochs: int = 4                      # P1: 1-2, P2: 3-5
     precision: str = "bf16"
-    grad_checkpointing: bool = True
+    grad_checkpointing: bool = True      # trades compute for memory; turn OFF on a big
+                                         # GPU (H100/H200/RTX6000) + bigger batch for speed
     frame_drop_aug: float = 0.05         # 5% frame drop-augmentation robustness
+    label_smoothing: float = 0.0         # optional; 0.05-0.1 regularizes the text CE
+    # speed / hardware
+    num_workers: int = 2                 # dataloader workers (raise to 4-8 on a fast box)
+    compile: bool = False                # torch.compile the model (big speedup on H100/
+                                         # H200/Blackwell/RTX6000; needs a warmup step)
+    attn_implementation: str = "sdpa"    # "sdpa" (built-in flash, works everywhere) or
+                                         # "flash_attention_2" (needs `pip install flash-attn`)
     # LoRA / partial unfreeze (Phase 1 uses LoRA)
     use_lora: bool = False
     lora_r: int = 16
@@ -187,6 +199,16 @@ class TrainConfig:
     seed: int = 1234
     # ddp (2x T4)
     ddp: bool = False
+    # eval splits + logging
+    val_frac: float = 0.02               # held out from training for validation
+    test_frac: float = 0.01              # held out for a single final test eval
+    eval_every: int = 500                # steps between validation evals (also runs each epoch end)
+    # Weights & Biases (optional) — set wandb_project (or WANDB_PROJECT env) to enable.
+    # Needs `pip install wandb` + WANDB_API_KEY in env (or `wandb login`). Logs train/val
+    # loss + every component, LR, per-epoch summaries, and a final test eval, all charted.
+    wandb_project: str | None = None
+    wandb_entity: str | None = None
+    wandb_run_name: str | None = None    # default: the training run-id
 
     @staticmethod
     def from_yaml(path: str | os.PathLike) -> "TrainConfig":

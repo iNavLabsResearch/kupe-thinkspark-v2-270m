@@ -1,0 +1,52 @@
+# Same recipe as configs/train_phase1.yaml, but sized for lots of VRAM + speed:
+#   - big real batch (32) with little/no grad accumulation
+#   - gradient checkpointing OFF (you have the memory; this is much faster)
+#   - torch.compile ON, more dataloader workers
+# On a 24GB L4 use configs/train_phase1.yaml instead (batch 4, grad_accum 16, checkpointing on).
+
+phase: 2
+base_model: "google/gemma-3-270m"
+hf_token_env: "HF_TOKEN"
+
+frames_dir: "data/frames_phase1"
+encoded_dir: "data/encoded"
+seq_len: 1024
+
+optimizer: "adamw"
+weight_decay: 0.1
+adam_beta1: 0.9
+adam_beta2: 0.95
+lr: 1.0e-4                 # Phase-2 LR
+warmup_ratio: 0.03
+batch_size: 32            # H100/H200/RTX6000/Blackwell have the VRAM; raise to 48-64 on 80GB
+grad_accum: 2             # effective batch 64
+epochs: 4
+precision: "bf16"
+grad_checkpointing: false # OFF on a big GPU = much faster (you have the VRAM)
+frame_drop_aug: 0.05
+label_smoothing: 0.0
+
+use_lora: false
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+
+out_dir: "artifacts/thinkspark-v2-350m/phase2"
+log_every: 20
+save_every: 500
+seed: 1234
+ddp: false                # multi-GPU: set true and launch with torchrun --nproc_per_node=N
+
+# eval splits + W&B
+val_frac: 0.02
+test_frac: 0.01
+eval_every: 500
+wandb_project: "kupe-thinkspark-270m"
+wandb_entity: null
+wandb_run_name: null
+
+# big-GPU speed
+num_workers: 8
+compile: true             # torch.compile — first step slow (compiling), then ~1.5-2x faster
+attn_implementation: "sdpa"   # or "flash_attention_2" if you `pip install flash-attn`

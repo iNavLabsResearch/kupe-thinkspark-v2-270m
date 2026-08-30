@@ -57,13 +57,33 @@ class ThinkSparkModel(nn.Module):
         hf_token: str | None = None,
         gradient_checkpointing: bool = True,
         extra_special_tokens: list[str] | None = None,
+        attn_implementation: str = "sdpa",
     ):
         super().__init__()
         from transformers import AutoModelForCausalLM
 
-        self.backbone = AutoModelForCausalLM.from_pretrained(
-            base_model, token=hf_token, torch_dtype=torch.bfloat16
-        )
+        # `dtype` (new) vs `torch_dtype` (old) across transformers versions, and
+        # `attn_implementation` selects the attention kernel: "sdpa" is PyTorch's built-in
+        # flash/mem-efficient attention (fast, works on every GPU incl. the current L4);
+        # "flash_attention_2" is faster still on H100/H200/Blackwell but needs the
+        # `flash-attn` package — if it's requested but unavailable, fall back to sdpa
+        # rather than crashing.
+        def _load(dtype_kw):
+            try:
+                return AutoModelForCausalLM.from_pretrained(
+                    base_model, token=hf_token, attn_implementation=attn_implementation,
+                    **dtype_kw)
+            except (ImportError, ValueError) as e:
+                if "flash" in str(e).lower() or attn_implementation != "sdpa":
+                    print(f"  attn_implementation={attn_implementation} unavailable "
+                          f"({e}) — falling back to sdpa")
+                    return AutoModelForCausalLM.from_pretrained(
+                        base_model, token=hf_token, attn_implementation="sdpa", **dtype_kw)
+                raise
+        try:
+            self.backbone = _load({"dtype": torch.bfloat16})
+        except TypeError:
+            self.backbone = _load({"torch_dtype": torch.bfloat16})
         if gradient_checkpointing:
             self.backbone.gradient_checkpointing_enable()
 

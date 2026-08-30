@@ -16,11 +16,20 @@ import json
 import math
 import os
 import time
+import warnings
 from collections import Counter
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+
+# Silence two purely-cosmetic, third-party deprecation warnings that spam the training
+# log and aren't actionable from here: torch's own gradient-checkpointing path still
+# calls the deprecated `torch.cpu.amp.autocast` internally, and transformers prints a
+# torch_dtype deprecation from deep in from_pretrained on some versions. Our code is
+# already on the new APIs (see model.py); these come from inside the libraries.
+warnings.filterwarnings("ignore", message=r".*torch\.cpu\.amp\.autocast.*")
+warnings.filterwarnings("ignore", message=r".*torch_dtype.*deprecated.*")
 
 from thinkspark import vocab
 from thinkspark.config import TrainConfig
@@ -67,6 +76,15 @@ class Trainer:
         self.shards = shard_paths
         torch.manual_seed(cfg.seed)
 
+        # TF32 matmuls — a free ~1.3-2x speedup for bf16/fp32 matmuls on every Ampere+
+        # GPU (A100/L4/H100/H200/RTX6000/Blackwell); a no-op on older/other hardware.
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
         self.ddp = cfg.ddp and int(os.environ.get("WORLD_SIZE", "1")) > 1
         self.rank = int(os.environ.get("RANK", "0"))
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -87,19 +105,32 @@ class Trainer:
             vap_horizon=cfg.vap_horizon,
             hf_token=hf_token,
             gradient_checkpointing=cfg.grad_checkpointing,
+            attn_implementation=getattr(cfg, "attn_implementation", "sdpa"),
         )
         model.resize_token_embeddings(len(self.tok))
         if cfg.use_lora:
             model = apply_lora(model, r=cfg.lora_r, alpha=cfg.lora_alpha,
                                dropout=cfg.lora_dropout)
         self.model = model.to(self.device)
+        if getattr(cfg, "compile", False):
+            # torch.compile: large speedup on H100/H200/Blackwell/RTX6000 (fuses kernels),
+            # modest on older cards; first step is slow (compiles) then fast. Guarded so a
+            # compile failure (unsupported op / old torch) degrades to eager, not a crash.
+            try:
+                self.model = torch.compile(self.model)
+                if self._is_main:
+                    print("  torch.compile ON (first step compiles, then runs fast)")
+            except Exception as e:
+                if self._is_main:
+                    print(f"  ! torch.compile failed ({e}) — running eager")
         if self.ddp:
             self.model = torch.nn.parallel.DistributedDataParallel(
                 self.model, device_ids=[self.local_rank])
 
         # phase loss
         if cfg.phase == 1:
-            self.loss_fn = Phase1Loss(lambda_vap=cfg.lambda_vap)
+            self.loss_fn = Phase1Loss(lambda_vap=cfg.lambda_vap,
+                                      label_smoothing=getattr(cfg, "label_smoothing", 0.0))
         else:
             alpha = class_alpha_from_freq(_class_frequency(shard_paths))
             self.loss_fn = Phase2Loss(alpha=alpha, gamma=cfg.focal_gamma,
@@ -107,20 +138,66 @@ class Trainer:
                                       l_vap=cfg.lambda_vap_p2)
         self.loss_fn = self.loss_fn.to(self.device)
 
-        # data
-        ds = ThinkSparkDataset(shard_paths, self.tok, phase=cfg.phase,
-                               seq_len=cfg.seq_len, vap_horizon=cfg.vap_horizon)
-        sampler = (torch.utils.data.distributed.DistributedSampler(ds)
+        # data — split into train / val / test (val + test held OUT of training so their
+        # loss is a real generalization signal, not memorized). Deterministic split via a
+        # seeded generator so the same held-out sets are used across resumes/DDP ranks.
+        full_ds = ThinkSparkDataset(shard_paths, self.tok, phase=cfg.phase,
+                                    seq_len=cfg.seq_len, vap_horizon=cfg.vap_horizon)
+        n_total = len(full_ds)
+        n_val = int(n_total * getattr(cfg, "val_frac", 0.0))
+        n_test = int(n_total * getattr(cfg, "test_frac", 0.0))
+        n_train = n_total - n_val - n_test
+        if n_train <= 0:
+            raise SystemExit(f"val_frac+test_frac too large for {n_total} samples")
+        gen = torch.Generator().manual_seed(cfg.seed)
+        train_ds, val_ds, test_ds = torch.utils.data.random_split(
+            full_ds, [n_train, n_val, n_test], generator=gen)
+        if self._is_main:
+            print(f"data split: train={n_train} val={n_val} test={n_test} "
+                  f"(of {n_total} samples)")
+
+        collate = make_collate(self.tok.pad_token_id, cfg.phase)
+        nw = getattr(cfg, "num_workers", 2)
+        pin = self.device.startswith("cuda")   # pinned host memory -> faster H2D copies
+        loader_kw = dict(collate_fn=collate, num_workers=nw, pin_memory=pin,
+                        persistent_workers=(nw > 0))
+        sampler = (torch.utils.data.distributed.DistributedSampler(train_ds)
                    if self.ddp else None)
         self.loader = DataLoader(
-            ds, batch_size=cfg.batch_size, shuffle=(sampler is None),
-            sampler=sampler, collate_fn=make_collate(self.tok.pad_token_id, cfg.phase),
-            num_workers=2, drop_last=True,
+            train_ds, batch_size=cfg.batch_size, shuffle=(sampler is None),
+            sampler=sampler, drop_last=True, **loader_kw,
         )
+        # eval loaders run on the main process only (no DDP sampler) — no shuffle,
+        # no drop_last so every held-out sample counts.
+        self.val_loader = (DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
+                                      drop_last=False, **loader_kw)
+                           if n_val > 0 else None)
+        self.test_loader = (DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False,
+                                       drop_last=False, **loader_kw)
+                            if n_test > 0 else None)
 
-        # optimiser
-        self.opt = torch.optim.AdamW(self.model.parameters(), lr=cfg.lr,
-                                     weight_decay=cfg.weight_decay)
+        # optimiser — split params into decay / no-decay groups (the standard LLM /
+        # Moshi practice): weight decay applies to matmul weights only, NOT to biases,
+        # LayerNorm/RMSNorm scales, or embeddings — decaying those hurts more than it
+        # regularizes. Betas default to (0.9, 0.95) per cfg (LLM-pretraining default).
+        decay, no_decay = [], []
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.dim() < 2 or n.endswith(".bias") or "norm" in n.lower() or "embed" in n.lower():
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        self.opt = torch.optim.AdamW(
+            [{"params": decay, "weight_decay": cfg.weight_decay},
+             {"params": no_decay, "weight_decay": 0.0}],
+            lr=cfg.lr,
+            betas=(getattr(cfg, "adam_beta1", 0.9), getattr(cfg, "adam_beta2", 0.95)),
+            eps=getattr(cfg, "adam_eps", 1e-8),
+        )
+        if self._is_main:
+            print(f"AdamW: {len(decay)} decay / {len(no_decay)} no-decay param tensors, "
+                  f"betas=({getattr(cfg,'adam_beta1',0.9)}, {getattr(cfg,'adam_beta2',0.95)})")
         self.steps_per_epoch = max(1, len(self.loader) // cfg.grad_accum)
         self.total_steps = self.steps_per_epoch * cfg.epochs
         self.warmup = int(self.total_steps * cfg.warmup_ratio)
@@ -139,6 +216,72 @@ class Trainer:
         self.on_checkpoint = None
         self._start_epoch = 0    # set by load_checkpoint() to resume mid-run
         self._start_step = 0
+        self.run_id = None       # set by thinkspark.train_runs.wire_run (used as wandb name)
+        self._wandb = None       # lazily initialized in train() on the main process
+
+    # ------------------------------------------------------------------ #
+    def _init_wandb(self):
+        """Start a Weights & Biases run if configured (main process only). No-op if
+        wandb isn't installed or no project is set — training continues either way."""
+        cfg = self.cfg
+        project = getattr(cfg, "wandb_project", None) or os.environ.get("WANDB_PROJECT")
+        if not project or not self._is_main:
+            return
+        try:
+            import wandb
+        except ImportError:
+            print("  wandb not installed — skipping W&B logging (`pip install wandb`)")
+            return
+        try:
+            self._wandb = wandb.init(
+                project=project,
+                entity=getattr(cfg, "wandb_entity", None) or os.environ.get("WANDB_ENTITY"),
+                name=getattr(cfg, "wandb_run_name", None) or self.run_id,
+                config=cfg.__dict__,
+                resume="allow",
+                id=(self.run_id.replace(":", "-") if self.run_id else None),
+            )
+            print(f"  W&B logging ON -> project '{project}' run '{self._wandb.name}'")
+        except Exception as e:
+            print(f"  ! wandb.init failed ({e}) — continuing without W&B logging")
+            self._wandb = None
+
+    def _wandb_log(self, metrics: dict, step: int):
+        if self._wandb is not None:
+            try:
+                self._wandb.log(metrics, step=step)
+            except Exception:
+                pass   # never let a logging hiccup interrupt training
+
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def evaluate(self, loader, split: str, step: int) -> dict:
+        """Average every loss component over a held-out loader (no grad, eval mode, no
+        frame-drop aug). Logs `<split>/<component>` to W&B and returns the metrics."""
+        if loader is None:
+            return {}
+        was_training = self.model.training
+        self.model.eval()
+        sums: dict[str, float] = {}
+        n = 0
+        for batch in loader:
+            batch = self._to_device(batch)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_bf16):
+                out = self.model(**self._model_inputs(batch))
+                losses = self.loss_fn(out, batch)
+            for k, v in losses.items():
+                if hasattr(v, "item"):
+                    sums[k] = sums.get(k, 0.0) + float(v.item())
+            n += 1
+        if was_training:
+            self.model.train()
+        if n == 0:
+            return {}
+        avg = {k: v / n for k, v in sums.items()}
+        pretty = " ".join(f"{k}={v:.4f}" for k, v in avg.items())
+        print(f"  [eval:{split}] step {step}: {pretty}")
+        self._wandb_log({f"{split}/{k}": v for k, v in avg.items()}, step)
+        return avg
 
     # ------------------------------------------------------------------ #
     def load_checkpoint(self, ckpt_dir: Path) -> None:
@@ -173,6 +316,7 @@ class Trainer:
     # ------------------------------------------------------------------ #
     def train(self):
         cfg = self.cfg
+        self._init_wandb()
         step = self._start_step         # 0 unless resumed via load_checkpoint()
         self._cur_step = step
         self.model.train()
@@ -181,6 +325,8 @@ class Trainer:
             if self.ddp and self.loader.sampler is not None:
                 self.loader.sampler.set_epoch(epoch)
             self.opt.zero_grad()
+            accum: dict[str, float] = {}   # running sum of true per-micro-batch losses
+            n_accum = 0                     # over the current grad_accum window
             for it, batch in enumerate(self.loader):
                 batch = self._to_device(batch)
                 batch = self._frame_drop_aug(batch)
@@ -191,6 +337,10 @@ class Trainer:
                     loss = losses["loss"] / cfg.grad_accum
 
                 loss.backward()
+                for k, v in losses.items():
+                    if hasattr(v, "item"):
+                        accum[k] = accum.get(k, 0.0) + float(v.item())
+                n_accum += 1
                 if (it + 1) % cfg.grad_accum == 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     lr = _cosine_warmup(step, self.total_steps, self.warmup, cfg.lr)
@@ -202,11 +352,26 @@ class Trainer:
                     self._cur_step = step
 
                     if self._is_main and step % cfg.log_every == 0:
-                        self._log(epoch, step, losses, lr)
+                        # TRUE effective-batch loss: mean over all grad_accum micro-batches
+                        # (~64 samples), not one 4-sample micro-batch x grad_accum (the old
+                        # reporting inflated the number by grad_accum AND was single-batch
+                        # noisy — that's why the loss looked like it bounced 10<->29 when it
+                        # was really ~0.6<->1.8 and trending down).
+                        self._log(epoch, step, {k: v / n_accum for k, v in accum.items()}, lr)
+                    accum, n_accum = {}, 0
+                    if self._is_main and step % getattr(cfg, "eval_every", 500) == 0:
+                        self.evaluate(self.val_loader, "val", step)
                     if self._is_main and step % cfg.save_every == 0:
                         self.save(f"step{step}")
+            # end-of-epoch validation summary
+            if self._is_main:
+                self.evaluate(self.val_loader, "val", step)
         if self._is_main:
             self.save("final")
+            # final held-out TEST eval — the honest generalization number
+            self.evaluate(self.test_loader, "test", self._cur_step)
+            if self._wandb is not None:
+                self._wandb.finish()
         if self.ddp:
             torch.distributed.destroy_process_group()
 
@@ -229,14 +394,20 @@ class Trainer:
         batch["audio_mask"] = mask.masked_fill(drop, 0)
         return batch
 
-    def _log(self, epoch, step, losses, lr):
-        parts = " ".join(f"{k}={v.item():.4f}" for k, v in losses.items()
-                         if k != "loss" and hasattr(v, "item"))
-        total = losses["loss"].item() * self.cfg.grad_accum
+    def _log(self, epoch, step, avg: dict, lr):
+        """avg: float dict of the true losses averaged over the last grad_accum window."""
+        total = avg.get("loss", 0.0)
+        parts = " ".join(f"{k}={v:.4f}" for k, v in avg.items() if k != "loss")
         self._loss_hist.append(total)
         print(f"[P{self.cfg.phase}] epoch {epoch} step {step}/{self.total_steps} "
               f"lr={lr:.2e} loss={total:.4f} {parts}")
         _maybe_plot(self._loss_hist)
+        # W&B: true train loss + every component + lr + epoch, charted live.
+        metrics = {"train/loss": total, "train/lr": lr, "train/epoch": epoch}
+        for k, v in avg.items():
+            if k != "loss":
+                metrics[f"train/{k}"] = v
+        self._wandb_log(metrics, step)
 
     def save(self, tag: str):
         model = self.model.module if self.ddp else self.model
