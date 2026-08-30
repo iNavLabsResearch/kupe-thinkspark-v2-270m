@@ -64,14 +64,17 @@ def npz_repo_path(lang: str, filename: str) -> str:
 
 def create_commit_with_backoff(api, *, repo: str, operations: list, commit_message: str,
                                max_retries: int = 10, base_backoff: float = 20.0,
-                               max_backoff: float = 300.0, log_fn=log) -> None:
-    """Retries a dataset-repo commit on rate-limit (429) or transient network errors,
-    with exponential backoff + jitter. Any other error is raised immediately."""
+                               max_backoff: float = 300.0, log_fn=log,
+                               repo_type: str = "dataset") -> None:
+    """Retries a repo commit on rate-limit (429) or transient network errors, with
+    exponential backoff + jitter. Any other error is raised immediately. `repo_type`
+    is "dataset" by default (Phase-1/2 data uploads); pass "model" to push model
+    checkpoints to a model repo."""
     attempt = 0
     backoff = base_backoff
     while True:
         try:
-            api.create_commit(repo_id=repo, repo_type="dataset",
+            api.create_commit(repo_id=repo, repo_type=repo_type,
                               operations=operations, commit_message=commit_message)
             return
         except Exception as exc:
@@ -95,12 +98,13 @@ def create_commit_with_backoff(api, *, repo: str, operations: list, commit_messa
             raise
 
 
-def ensure_repo(api, repo: str, private: bool) -> None:
-    """Create the dataset repo if it doesn't exist yet, with error messages that
-    distinguish a genuinely bad/expired token (401) from a valid token that simply has
-    no create-rights in `repo`'s namespace (403 — e.g. an org you're not a member of)."""
+def ensure_repo(api, repo: str, private: bool, repo_type: str = "dataset") -> None:
+    """Create the repo if it doesn't exist yet, with error messages that distinguish a
+    genuinely bad/expired token (401) from a valid token that simply has no create-rights
+    in `repo`'s namespace (403 — e.g. an org you're not a member of). `repo_type` is
+    "dataset" by default; pass "model" for a model-checkpoint repo."""
     try:
-        api.create_repo(repo_id=repo, repo_type="dataset", private=private, exist_ok=True)
+        api.create_repo(repo_id=repo, repo_type=repo_type, private=private, exist_ok=True)
     except Exception as exc:
         msg = str(exc).lower()
         if "401" in msg or "unauthorized" in msg or "invalid user token" in msg:
@@ -119,6 +123,84 @@ def ensure_repo(api, repo: str, private: bool) -> None:
             ) from exc
         if "already" not in msg and "409" not in msg and "exist" not in msg:
             raise
+
+
+def make_checkpoint_uploader(repo: str, phase: str, run_id: str, private: bool,
+                             token: str | None):
+    """Returns an `on_checkpoint(tag, ckpt_dir)` callable that uploads a checkpoint dir
+    live during training, into `<phase>/runs/<run_id>/<tag>/...` on a MODEL repo. Used by
+    the training scripts so an interrupted run can be resumed from HF. Also uploads a
+    small `<phase>/runs/<run_id>/latest.json` pointer so a resumer knows the newest tag
+    without listing the whole repo. Repo is created (idempotently) on the first call."""
+    from huggingface_hub import CommitOperationAdd, HfApi
+
+    api = HfApi(token=token)
+    ensured = {"done": False}
+
+    def _on_checkpoint(tag: str, ckpt_dir) -> None:
+        from pathlib import Path
+        ckpt_dir = Path(ckpt_dir)
+        if not ensured["done"]:
+            ensure_repo(api, repo, private, repo_type="model")
+            ensured["done"] = True
+
+        base = f"{phase}/runs/{run_id}"
+        files = [f for f in sorted(ckpt_dir.rglob("*")) if f.is_file()]
+        ops = [CommitOperationAdd(path_in_repo=f"{base}/{tag}/{f.relative_to(ckpt_dir)}",
+                                  path_or_fileobj=str(f)) for f in files]
+        # a tiny pointer to the newest checkpoint tag for easy resume
+        import json as _json
+        import tempfile
+        ptr = Path(tempfile.gettempdir()) / f"_latest_{run_id}.json"
+        ptr.write_text(_json.dumps({"latest_tag": tag}), encoding="utf-8")
+        ops.append(CommitOperationAdd(path_in_repo=f"{base}/latest.json", path_or_fileobj=str(ptr)))
+
+        log(f"uploading checkpoint {tag} -> {repo}:{base}/{tag}/ ({len(files)} files)")
+        create_commit_with_backoff(
+            api, repo=repo, repo_type="model", operations=ops,
+            commit_message=f"{phase} run {run_id}: checkpoint {tag}",
+        )
+
+    return _on_checkpoint
+
+
+def download_run_checkpoint(repo: str, phase: str, run_id: str, dest_dir,
+                            token: str | None, tag: str | None = None):
+    """Download a run's checkpoint from a MODEL repo into `dest_dir/<tag>/` so training
+    can resume from it. If `tag` is None, reads `<phase>/runs/<run_id>/latest.json` to
+    find the newest tag. Returns the local Path to the checkpoint dir, or None if the run
+    doesn't exist on the repo yet (fresh start)."""
+    import json as _json
+    from pathlib import Path
+
+    from huggingface_hub import hf_hub_download, snapshot_download
+
+    base = f"{phase}/runs/{run_id}"
+    if tag is None:
+        try:
+            latest_path = hf_hub_download(repo_id=repo, repo_type="model", token=token,
+                                          filename=f"{base}/latest.json")
+            tag = _json.loads(Path(latest_path).read_text())["latest_tag"]
+        except Exception:
+            return None   # no such run / no latest pointer yet -> fresh start
+
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        snap = snapshot_download(repo_id=repo, repo_type="model", token=token,
+                                 allow_patterns=[f"{base}/{tag}/*"], local_dir=str(dest_dir / ".hf_resume_tmp"))
+    except Exception:
+        return None
+    src = Path(snap) / base / tag
+    if not (src / "model.pt").exists():
+        return None
+    final = dest_dir / tag
+    final.mkdir(parents=True, exist_ok=True)
+    import shutil
+    for f in src.iterdir():
+        shutil.move(str(f), str(final / f.name))
+    shutil.rmtree(dest_dir / ".hf_resume_tmp", ignore_errors=True)
+    return final
 
 
 def pack_by_file_count(items: list, files_per_item: int, files_per_commit: int) -> list[list]:

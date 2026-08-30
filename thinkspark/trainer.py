@@ -131,6 +131,41 @@ class Trainer:
             self.out_dir.mkdir(parents=True, exist_ok=True)
         self._loss_hist: list[float] = []
 
+        # Resume + upload hooks (set by the training script; both default to inert so
+        # nothing changes for callers that don't use them).
+        # on_checkpoint(tag, ckpt_dir) is called right after every save() on the main
+        # process — the training script uses it to upload each checkpoint to HF live,
+        # during training, so an interrupted run can be resumed from HF.
+        self.on_checkpoint = None
+        self._start_epoch = 0    # set by load_checkpoint() to resume mid-run
+        self._start_step = 0
+
+    # ------------------------------------------------------------------ #
+    def load_checkpoint(self, ckpt_dir: Path) -> None:
+        """Restore model + optimizer weights and the (epoch, step) position from a
+        checkpoint dir written by save(), so train() continues from there instead of
+        from scratch. Model weights and optimizer state continue exactly; the resumed
+        epoch's data ordering restarts (a shuffled streaming loader can't be
+        deterministically fast-forwarded), but the LR schedule and global step counter
+        continue correctly since they key off the restored global step."""
+        model = self.model.module if self.ddp else self.model
+        state = torch.load(ckpt_dir / "model.pt", map_location=self.device)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        opt_path = ckpt_dir / "opt.pt"
+        if opt_path.exists():
+            try:
+                self.opt.load_state_dict(torch.load(opt_path, map_location=self.device))
+            except Exception as e:
+                print(f"  ! couldn't restore optimizer state ({e}) — continuing with a "
+                      f"fresh optimizer (weights still resumed)")
+        ts_path = ckpt_dir / "trainer_state.json"
+        if ts_path.exists():
+            ts = json.loads(ts_path.read_text())
+            self._start_epoch = int(ts.get("epoch", 0))
+            self._start_step = int(ts.get("step", 0))
+        print(f"  resumed from {ckpt_dir} — epoch {self._start_epoch}, step "
+              f"{self._start_step} (missing={len(missing)}, unexpected={len(unexpected)})")
+
     @property
     def _is_main(self) -> bool:
         return (not self.ddp) or self.rank == 0
@@ -138,9 +173,11 @@ class Trainer:
     # ------------------------------------------------------------------ #
     def train(self):
         cfg = self.cfg
-        step = 0
+        step = self._start_step         # 0 unless resumed via load_checkpoint()
+        self._cur_step = step
         self.model.train()
-        for epoch in range(cfg.epochs):
+        for epoch in range(self._start_epoch, cfg.epochs):
+            self._cur_epoch = epoch
             if self.ddp and self.loader.sampler is not None:
                 self.loader.sampler.set_epoch(epoch)
             self.opt.zero_grad()
@@ -162,6 +199,7 @@ class Trainer:
                     self.opt.step()
                     self.opt.zero_grad()
                     step += 1
+                    self._cur_step = step
 
                     if self._is_main and step % cfg.log_every == 0:
                         self._log(epoch, step, losses, lr)
@@ -205,10 +243,28 @@ class Trainer:
         ckpt_dir = self.out_dir / tag
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), ckpt_dir / "model.pt")
+        # optimizer state + position, so load_checkpoint() can genuinely CONTINUE (not
+        # just warm-start) — this is what makes resume-from-HF actually pick up where an
+        # interrupted run left off.
+        torch.save(self.opt.state_dict(), ckpt_dir / "opt.pt")
+        (ckpt_dir / "trainer_state.json").write_text(
+            json.dumps({"epoch": getattr(self, "_cur_epoch", 0),
+                       "step": getattr(self, "_cur_step", 0),
+                       "tag": tag}, indent=2), encoding="utf-8")
         self.tok.save_pretrained(ckpt_dir)
         (ckpt_dir / "config.json").write_text(
             json.dumps(self.cfg.__dict__, indent=2), encoding="utf-8")
         print(f"  saved checkpoint -> {ckpt_dir}")
+        # Live upload hook (set by the training script) — runs on the main process only
+        # (save() is only ever called under `if self._is_main`). A failure here must NOT
+        # kill training: the local checkpoint is already safely on disk, and the next
+        # save's upload (or a manual push later) will catch up.
+        if self.on_checkpoint is not None:
+            try:
+                self.on_checkpoint(tag, ckpt_dir)
+            except Exception as e:
+                print(f"  ! checkpoint upload hook failed for {tag} (training continues, "
+                      f"local checkpoint is safe): {e}")
 
 
 def _maybe_plot(hist: list[float]):
