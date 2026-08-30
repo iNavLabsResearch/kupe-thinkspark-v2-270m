@@ -13,8 +13,9 @@ optimizer: "adamw"
 weight_decay: 0.1
 lr: 1.0e-4                 # Phase-2 LR (Section 9.4)
 warmup_ratio: 0.03
-batch_size: 8
-grad_accum: 8             # effective batch 32-64
+batch_size: 4             # same reasoning as Phase-1 (256K-vocab CE is the memory driver
+                          # on a 24GB L4) — 4 is the safe default; raise if VRAM allows.
+grad_accum: 16            # effective batch 64
 epochs: 4                 # P2: 3-5 epochs
 precision: "bf16"
 grad_checkpointing: true

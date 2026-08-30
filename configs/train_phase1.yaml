@@ -13,8 +13,13 @@ optimizer: "adamw"
 weight_decay: 0.1
 lr: 2.0e-4                 # Phase-1 LR (Section 9.4)
 warmup_ratio: 0.03
-batch_size: 16
-grad_accum: 4             # effective batch 32-64
+batch_size: 4             # per-step micro-batch. Gemma-3's 256K-token vocab makes the
+                          # alignment cross-entropy tensor huge ([B, seq_len, 256K]) —
+                          # batch_size 16 OOM'd a 24GB L4 outright. 4 fits comfortably;
+                          # try 6-8 if you have VRAM headroom (watch nvidia-smi), drop to
+                          # 2 if you still OOM.
+grad_accum: 16            # effective batch 64 (4 x 16) — same as before, just split into
+                          # smaller GPU steps so peak memory is ~4x lower.
 epochs: 2                 # P1: 1-2 epochs
 precision: "bf16"
 grad_checkpointing: true
