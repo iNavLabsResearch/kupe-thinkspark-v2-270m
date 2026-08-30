@@ -155,17 +155,28 @@ class ThinkSparkModel(nn.Module):
         inputs_embeds = torch.cat(parts, dim=1)                   # [B, L_total, H]
         attn = torch.cat(masks, dim=1)                            # [B, L_total]
 
-        out = self.backbone.model(
+        # Call the FULL backbone with output_hidden_states=True rather than reaching into
+        # `self.backbone.model` for a base-model output. Real observed break: on this
+        # transformers version `self.backbone.model(...)` returns a CausalLMOutputWithPast
+        # (which has `.logits`, NOT `.last_hidden_state`), so the old `out.last_hidden_state`
+        # raised AttributeError. `out.hidden_states[-1]` is the final post-norm hidden
+        # state (== what `.last_hidden_state` used to give) on every transformers version,
+        # and `out.logits` is exactly `lm_head(that hidden)` — so we reuse it instead of
+        # re-running the lm head, which also drops a dependency on the exact `.lm_head`
+        # attribute location (differs between Gemma3ForCausalLM and the conditional-gen
+        # wrapper).
+        out = self.backbone(
             inputs_embeds=inputs_embeds,
             attention_mask=attn,
             use_cache=False,
+            output_hidden_states=True,
         )
-        hidden = out.last_hidden_state                            # [B, L_total, H]
+        hidden = out.hidden_states[-1]                            # [B, L_total, H]
 
         audio_hidden = hidden[:, audio_start:audio_start + T, :]  # [B, T, H]
         control_logits = self.control_head(audio_hidden)          # [B, T, num_flags]
         vap_logits = self.vap_head(audio_hidden)                  # [B, T, H_vap]
-        lm_logits = self.backbone.lm_head(hidden)                 # [B, L_total, vocab]
+        lm_logits = out.logits                                    # [B, L_total, vocab]
 
         return ModelOutputs(
             control_logits=control_logits,
