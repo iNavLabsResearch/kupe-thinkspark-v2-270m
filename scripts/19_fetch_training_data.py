@@ -79,13 +79,34 @@ def _list_repo_files(api, repo: str, patterns: list[str]) -> list[str]:
 def _snapshot_download(repo: str, patterns: list[str], token: str | None, local_dir: Path) -> Path:
     try:
         from huggingface_hub import snapshot_download
+        from huggingface_hub.errors import HfHubHTTPError
     except ImportError:
         raise SystemExit("`huggingface_hub` not installed. `pip install huggingface_hub`.")
-    path = snapshot_download(
-        repo_id=repo, repo_type="dataset", token=token,
-        allow_patterns=patterns, local_dir=str(local_dir),
-    )
-    return Path(path)
+    import os, time
+    # xet's per-file token endpoint (xet-read-token) is what trips HF's 1000-req/5-min
+    # limit on big many-file repos — the classic path is slower but doesn't fan out
+    # token calls, so it stays under the quota. Fewer workers keeps it there too.
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    max_workers = int(os.environ.get("HF_FETCH_WORKERS", "4"))
+    delay = 30
+    for attempt in range(1, 9):  # up to 8 tries; snapshot_download resumes each time
+        try:
+            path = snapshot_download(
+                repo_id=repo, repo_type="dataset", token=token,
+                allow_patterns=patterns, local_dir=str(local_dir),
+                max_workers=max_workers,
+            )
+            return Path(path)
+        except HfHubHTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status not in (429, 500, 502, 503, 504) or attempt == 8:
+                raise
+            wait = min(delay, 300)
+            utc_log(f"[fetch] {status} from HF (attempt {attempt}/8) — "
+                   f"resuming in {wait}s (already-fetched files are skipped)")
+            time.sleep(wait)
+            delay *= 2
+    return Path(local_dir)  # unreachable; loop either returns or raises
 
 
 def _move_flatten(src_root: Path, glob_pattern: str, dest_dir: Path, *, rename=None) -> tuple[int, int]:
