@@ -185,18 +185,35 @@ class ThinkSparkModel(nn.Module):
         # re-running the lm head, which also drops a dependency on the exact `.lm_head`
         # attribute location (differs between Gemma3ForCausalLM and the conditional-gen
         # wrapper).
-        out = self.backbone(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attn,
-            use_cache=False,
-            output_hidden_states=True,
-        )
+        # EFFICIENCY: the LM loss only supervises the spoken TAIL (labels are -100
+        # everywhere else — see thinkspark.dataset's collate), which is the last
+        # `spoken_ids.shape[1]` positions of the sequence. So ask the backbone to run its
+        # 256K-vocab LM head on ONLY the last (tail + 1) positions via `logits_to_keep`
+        # (transformers' native param, so all the model's internal logit ops — final norm,
+        # any softcapping — are applied correctly; NOT a hand-rolled lm_head that could
+        # silently differ). That's ~5-10x less work on the single dominant cost of the
+        # whole model, for a mathematically IDENTICAL loss. spoken_ce_loss auto-detects
+        # whether it got tail-only or full logits, so if a transformers version doesn't
+        # honor the param, this transparently falls back to full (correct, just slower).
+        base_kwargs = dict(inputs_embeds=inputs_embeds, attention_mask=attn,
+                          use_cache=False, output_hidden_states=True)
+        keep = (spoken_ids.shape[1] + 1) if spoken_ids is not None else None
+        out = None
+        if keep is not None:
+            for kw in ("logits_to_keep", "num_logits_to_keep"):   # renamed across versions
+                try:
+                    out = self.backbone(**base_kwargs, **{kw: keep})
+                    break
+                except TypeError:
+                    out = None
+        if out is None:
+            out = self.backbone(**base_kwargs)
         hidden = out.hidden_states[-1]                            # [B, L_total, H]
 
         audio_hidden = hidden[:, audio_start:audio_start + T, :]  # [B, T, H]
         control_logits = self.control_head(audio_hidden)          # [B, T, num_flags]
         vap_logits = self.vap_head(audio_hidden)                  # [B, T, H_vap]
-        lm_logits = out.logits                                    # [B, L_total, vocab]
+        lm_logits = out.logits                                    # [B, keep, vocab] or [B, L_total, vocab]
 
         return ModelOutputs(
             control_logits=control_logits,

@@ -19,9 +19,15 @@ adam_beta1: 0.9
 adam_beta2: 0.95
 lr: 2.0e-4                 # Phase-1 LR (Section 9.4)
 warmup_ratio: 0.03
-batch_size: 32            # H100/H200/RTX6000/Blackwell have the VRAM; raise to 48-64 on 80GB
-grad_accum: 2             # effective batch 64
-epochs: 2
+batch_size: 48            # tail-only LM head (see thinkspark/model.py) frees a lot of
+                          # VRAM vs computing 256K-vocab logits for the whole sequence, so
+                          # an 80GB H100 fits 48 comfortably now. Drop to 32 if you OOM.
+grad_accum: 1             # effective batch 48 in ONE forward/backward — fewer Python-loop
+                          # steps than accumulating, so faster wall-clock on a big GPU.
+epochs: 1                 # Phase-1 alignment is 1-2 epochs per the recipe. 1 epoch over
+                          # ~165k samples (~400h audio) is a full, legitimate alignment
+                          # pass — not a shortcut — and keeps this well under an hour on an
+                          # H100. Bump to 2 if you want the extra polish and have the time.
 precision: "bf16"
 grad_checkpointing: false # OFF on a big GPU = much faster (you have the VRAM)
 frame_drop_aug: 0.05

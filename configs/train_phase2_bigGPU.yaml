@@ -18,9 +18,11 @@ adam_beta1: 0.9
 adam_beta2: 0.95
 lr: 1.0e-4                 # Phase-2 LR
 warmup_ratio: 0.03
-batch_size: 32            # H100/H200/RTX6000/Blackwell have the VRAM; raise to 48-64 on 80GB
-grad_accum: 2             # effective batch 64
-epochs: 4
+batch_size: 48            # tail-only LM head frees VRAM (see thinkspark/model.py); 48 fits
+                          # an 80GB H100. Drop to 32 if you OOM (Phase-2 is a full finetune,
+                          # heavier than Phase-1's LoRA).
+grad_accum: 1             # effective batch 48
+epochs: 4                 # Phase-2 referee = 3-5 epochs (smaller ~55h corpus, needs more passes)
 precision: "bf16"
 grad_checkpointing: false # OFF on a big GPU = much faster (you have the VRAM)
 frame_drop_aug: 0.05

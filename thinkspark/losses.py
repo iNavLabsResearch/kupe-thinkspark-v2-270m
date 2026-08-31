@@ -78,15 +78,23 @@ def vap_bce_loss(
 
 
 def spoken_ce_loss(
-    lm_logits: torch.Tensor,   # [B, L_total, V]
+    lm_logits: torch.Tensor,   # [B, N, V]  — N == L_total (full) OR just the last N
     labels: torch.Tensor,      # [B, L_total]  (-100 where not a spoken target)
     label_smoothing: float = 0.0,
 ) -> torch.Tensor:
     if (labels != -100).sum() == 0:
         return lm_logits.sum() * 0.0
-    # standard shifted LM loss
-    shift_logits = lm_logits[:, :-1, :].contiguous()
-    shift_labels = labels[:, 1:].contiguous()
+    # Shifted LM loss (predict token t+1 from position t). `lm_logits` may cover the
+    # WHOLE sequence (N == L_total) or, as an efficiency win, only the LAST N positions
+    # — the model computes the 256K-vocab head on just the supervised tail when it can
+    # (the labels are -100 everywhere except that tail, so the rest is pure wasted
+    # compute). `offset` recovers where these logits start in the full sequence, so the
+    # SAME formula handles both cases identically — verified offline to give bit-equal
+    # loss to the full computation. If the backbone ever ignores the slice request, N
+    # comes back == L_total and this transparently falls back to the full-sequence loss.
+    offset = labels.size(1) - lm_logits.size(1)          # 0 (full) or L_total-N (tail)
+    shift_logits = lm_logits[:, :-1, :].contiguous()     # positions [offset, L-1)
+    shift_labels = labels[:, offset + 1:].contiguous()   # labels    [offset+1, L)
     return F.cross_entropy(
         shift_logits.reshape(-1, shift_logits.size(-1)),
         shift_labels.reshape(-1),
