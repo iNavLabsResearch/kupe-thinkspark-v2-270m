@@ -1,84 +1,174 @@
 ---
 title: "Training"
-description: "Phase 1 (modality alignment) then Phase 2 (referee fine-tune)"
+description: "Fetch data, then Phase 1 (modality alignment) and Phase 2 (referee fine-tune) — L4 or a big GPU"
 icon: "brain"
 ---
 
 <Warning>
-Set `HF_TOKEN` first — Gemma-3-270M weights are gated on Hugging Face.
+Set `HF_TOKEN` first (Gemma-3-270M is gated) — and if you want live checkpoint upload
+(on by default) or W&B logging, set those in the SAME shell/cell too, not a separate
+`!export` cell on Kaggle/Jupyter (that doesn't persist to a later cell's subprocess):
 ```bash
-export HF_TOKEN=hf_...
+export HF_TOKEN=hf_...          # WRITE access — needed to fetch Gemma-3 AND to push checkpoints
+export WANDB_API_KEY=hf_...     # optional — enables live train/val/test charts
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # reduces CUDA memory fragmentation
 ```
 </Warning>
 
-<Steps>
+## 1 · Fetch training data
 
-<Step title="Phase 1 — modality alignment (LoRA)">
-Needs the Phase-1 frame shards built from the free open corpora (see
-[Preprocessing](/commands/preprocessing)).
+Each phase has its own focused fetch script, pulling straight into the local layout the
+trainers read — see [Full cheatsheet](/commands/cheatsheet) for more on both.
 
+<Tabs>
+<Tab title="Phase 1">
+Lands already Mimi-encoded (Parquet shards unpacked into `.npz` + frame records) — ready
+to train immediately, no encode step:
 ```bash
+python scripts/20_fetch_phase1.py
+```
+```bash
+python scripts/20_fetch_phase1.py --repo <user>/<repo>   # a different repo than the default
+```
+</Tab>
+<Tab title="Phase 2">
+Lands as raw audio + full scenario schema — needs a local encode + frame-build pass
+first (fast, free, no API calls):
+```bash
+python scripts/21_fetch_phase2.py
+
+python scripts/00_encode_audio.py --audio-dir data/audio --out-dir data/encoded
+python scripts/04_build_frames.py --in data/scenarios/scenarios_all.jsonl \
+    --frames-out data/frames/frames_all.jsonl
+```
+</Tab>
+</Tabs>
+
+## 2 · Train
+
+Two ready-made configs per phase — pick the one matching your GPU. The big-GPU configs
+apply real, verified optimizations (see the warning below the table) beyond just a
+bigger batch size.
+
+<Tabs>
+<Tab title="L4 (24GB)">
+```bash
+# Phase 1 — modality alignment (LoRA):
 python scripts/06_train_phase1.py --config configs/train_phase1.yaml \
     --frames "data/frames_phase1/*.jsonl"
 ```
-
-**2×T4 DDP:**
 ```bash
-torchrun --nproc_per_node=2 scripts/06_train_phase1.py \
-    --config configs/train_phase1.yaml --frames "data/frames_phase1/*.jsonl"
-```
-
-Trains $\mathcal{L}_{P1} = \mathcal{L}_{\text{align}} + 0.3 \cdot \mathcal{L}_{\text{vap}}$
-with LoRA (r=16, alpha=32), LR 2e-4, 1–2 epochs. Checkpoints land in
-`artifacts/thinkspark-v2-350m/phase1/`.
-</Step>
-
-<Step title="Phase 2 — referee fine-tune (full bf16)">
-```bash
+# Phase 2 — referee fine-tune (full bf16), warm-started from Phase 1:
 python scripts/07_train_phase2.py --config configs/train_phase2.yaml \
     --frames "data/frames/*.jsonl" \
-    --init artifacts/thinkspark-v2-350m/phase1/final/model.pt
+    --init artifacts/thinkspark-v2-350m/phase1/runs/<run-id>/final/model.pt
 ```
-
-No Phase-1 checkpoint yet? Skip `--init` and train Phase 2 from the base weights directly
-(works, just less sample-efficient):
+`configs/train_phase{1,2}.yaml`: `batch_size: 4`, `grad_accum: 16` (effective batch 64),
+`grad_checkpointing: true` — sized to fit a 24GB card without OOM (a real batch_size 16
+run OOM'd outright: Gemma-3's 256K-vocab cross-entropy tensor alone needs ~9GB at that
+size).
+</Tab>
+<Tab title="H100 / H200 / RTX6000 / Blackwell (80GB)">
 ```bash
-python scripts/07_train_phase2.py --config configs/train_phase2.yaml --frames "data/frames/*.jsonl"
+# Phase 1:
+python scripts/06_train_phase1.py --config configs/train_phase1_bigGPU.yaml \
+    --frames "data/frames_phase1/*.jsonl"
 ```
-
-**2×T4 DDP:**
 ```bash
-torchrun --nproc_per_node=2 scripts/07_train_phase2.py \
-    --config configs/train_phase2.yaml --frames "data/frames/*.jsonl"
+# Phase 2, warm-started from Phase 1:
+python scripts/07_train_phase2.py --config configs/train_phase2_bigGPU.yaml \
+    --frames "data/frames/*.jsonl" \
+    --init artifacts/thinkspark-v2-350m/phase1/runs/<run-id>/final/model.pt
+```
+`configs/train_phase{1,2}_bigGPU.yaml`: `batch_size: 48`, `grad_accum: 1` (one
+forward/backward per step, no accumulation loop), `grad_checkpointing: false` (you have
+the VRAM — this alone is a large speedup), TF32 matmuls, SDPA attention, 8 dataloader
+workers with pinned memory. Phase-1 is 1 epoch (still a full, legitimate alignment pass
+over ~400h — bump to 2 if you have time to spare); Phase-2 stays 3-5 epochs per the
+recipe (smaller corpus, needs more passes).
+</Tab>
+</Tabs>
+
+<Warning>
+**The real speed win, on every config, every GPU:** the LM head only needs to run on the
+spoken-tail positions actually supervised by the loss (everything else is
+`ignore_index=-100`) — not the whole ~1000-token sequence. The model requests only that
+tail via transformers' native `logits_to_keep`, cutting the single most expensive
+op (a 256K-vocab head) by ~5-10x. **Verified bit-identical loss** to the full computation
+offline (diff `0.00e+00`) — zero quality cost, pure speedup. Falls back to the full
+computation automatically if a transformers version doesn't honor the parameter.
+
+`torch.compile` is deliberately **off** in both big-GPU configs — a real, confirmed
+incompatibility on current transformers: combining `output_hidden_states=True` with
+LoRA/PEFT under Dynamo raises `KeyError: 'hidden_states'` mid-graph, not at compile time.
+If you re-enable `compile: true` after a library upgrade, the trainer self-heals a
+runtime break on the first batch by falling back to eager rather than crashing the run —
+but verify a few steps before trusting a long run.
+</Warning>
+
+## Runs, resume, and live checkpoint upload
+
+Every invocation is a **run** (own id, own checkpoint folder). Checkpoints save every
+`save_every` steps (model + optimizer + exact epoch/step position) and, unless
+`--no-push`, upload **live during training** to `<phase>/runs/<run-id>/<tag>/` on the
+model repo (default `anuj-inavlabs/kupe-thinkspark-audio-270m`) — so an interrupted run
+resumes from HF even on a fresh box.
+
+```bash
+# force a brand-new run from step 0 (ignores any existing checkpoint for this run-id):
+python scripts/06_train_phase1.py ... --fresh
+
+# resume a specific run — local checkpoint if present, else pulled from HF automatically:
+python scripts/06_train_phase1.py ... --run-id 20260830-101500 --resume
+
+# train without uploading anything (local checkpoints only):
+python scripts/06_train_phase1.py ... --no-push
 ```
 
-Trains
-$\mathcal{L}_{P2} = 1.0\cdot\mathcal{L}_{\text{ctrl}}(\text{focal}) + 0.5\cdot\mathcal{L}_{\text{txt}} + 0.2\cdot\mathcal{L}_{\text{vap}}$,
-full fine-tune, LR 1e-4, 3–5 epochs. Checkpoints land in
-`artifacts/thinkspark-v2-350m/phase2/`.
-</Step>
+`--init` (Phase 2 only) warm-starts from a Phase-1 checkpoint, but is ignored when
+`--resume` restores this Phase-2 run's own weights instead.
 
-</Steps>
+**Manual push** (outside training, e.g. after the fact):
+```bash
+python scripts/22_push_checkpoints.py --ckpt-dir artifacts/thinkspark-v2-350m/phase1 --phase phase1 --all
+```
 
 ## Watching it train
 
-Loss curves print to the terminal every `log_every` steps (default 20) using `plotext` if
-installed — no extra setup needed, works over SSH/Kaggle terminals:
-
+Terminal loss curves print every `log_every` steps (via `plotext` if installed) — the
+reported loss is the TRUE value averaged over the full effective batch (all
+`grad_accum` micro-batches), not a single noisy micro-batch:
 ```
 [P2] epoch 1 step 340/2000 lr=8.4e-05 loss=1.2841 ctrl=0.712 txt=0.401 vap=0.171
 ```
 
-## Tuning knobs (in `configs/train_phase{1,2}.yaml`)
+**Weights & Biases** (set `WANDB_API_KEY`, `wandb_project` in the config): live charts
+for train loss + every component + LR, a full **validation** eval every `eval_every`
+steps and at each epoch end (2% of data held out, `val_frac`), and one final **test**
+eval at the very end (1% held out, `test_frac`) — the honest generalization number, never
+touched during training. Compare `train/loss` vs `val/loss` on the dashboard: they
+tracking together and both falling is healthy; `val/loss` rising while `train/loss` keeps
+falling is overfitting.
+
+## Tuning knobs (`configs/train_phase{1,2}[_bigGPU].yaml`)
 
 | Field | What it controls |
 |---|---|
-| `batch_size` / `grad_accum` | effective batch = batch_size × grad_accum (target 32–64) |
+| `batch_size` / `grad_accum` | effective batch = batch_size × grad_accum |
+| `grad_checkpointing` | trade compute for memory; turn off on a big GPU for speed |
 | `use_lora` | `true` for Phase 1, `false` (full fine-tune) for Phase 2 |
+| `adam_beta1` / `adam_beta2` | AdamW betas — default (0.9, 0.95), the LLM-pretraining/Moshi default |
+| `label_smoothing` | optional (0-0.1) extra regularization on the text CE |
 | `lambda_ctrl` / `lambda_txt` / `lambda_vap_p2` | Phase-2 loss weights (default 1.0/0.5/0.2) |
 | `focal_gamma` | focal-loss sharpness on the control head (default 2.0) |
 | `frame_drop_aug` | fraction of frames randomly dropped for robustness (default 5%) |
+| `val_frac` / `test_frac` / `eval_every` | held-out eval splits + cadence |
+| `wandb_project` / `wandb_entity` | set to enable W&B; `null` disables |
+| `num_workers` / `compile` / `attn_implementation` | dataloader workers, torch.compile, sdpa/flash_attention_2 |
 | `ddp` | set `true` when launching with `torchrun` |
+
+Optimizer weight decay applies only to real matmul weights, never to biases,
+norm scales, or embeddings — the standard LLM/Moshi practice, not decaying those.
 
 <Card title="Next: Evaluation" icon="chart-line" href="/commands/evaluation">
   Check the trained checkpoint against the Section-10 target table.
