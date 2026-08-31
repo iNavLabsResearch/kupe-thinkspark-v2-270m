@@ -111,18 +111,22 @@ class Trainer:
         if cfg.use_lora:
             model = apply_lora(model, r=cfg.lora_r, alpha=cfg.lora_alpha,
                                dropout=cfg.lora_dropout)
-        self.model = model.to(self.device)
+        self._eager_model = model.to(self.device)   # kept for the runtime fallback below
+        self.model = self._eager_model
         if getattr(cfg, "compile", False):
             # torch.compile: large speedup on H100/H200/Blackwell/RTX6000 (fuses kernels),
-            # modest on older cards; first step is slow (compiles) then fast. Guarded so a
-            # compile failure (unsupported op / old torch) degrades to eager, not a crash.
-            try:
-                self.model = torch.compile(self.model)
-                if self._is_main:
-                    print("  torch.compile ON (first step compiles, then runs fast)")
-            except Exception as e:
-                if self._is_main:
-                    print(f"  ! torch.compile failed ({e}) — running eager")
+            # modest on older cards. Real observed gap this closes: `torch.compile()`
+            # itself basically never raises (it's lazy) — the actual failure surfaces
+            # later, mid-forward-pass under Dynamo tracing on the first real batch (hit in
+            # practice: a transformers/PEFT + output_hidden_states incompatibility raised
+            # a `KeyError` deep inside Dynamo's graph-resume, not at compile() time at
+            # all). `train()`'s first step now runs through `self._forward_with_fallback`,
+            # which catches exactly that and permanently switches back to the eager model
+            # instead of crashing the whole run.
+            self.model = torch.compile(self._eager_model)
+            if self._is_main:
+                print("  torch.compile ON (first step compiles + runtime-verified, then runs fast; "
+                     "auto-falls back to eager if compilation breaks on the first real batch)")
         if self.ddp:
             self.model = torch.nn.parallel.DistributedDataParallel(
                 self.model, device_ids=[self.local_rank])
@@ -313,10 +317,31 @@ class Trainer:
     def _is_main(self) -> bool:
         return (not self.ddp) or self.rank == 0
 
+    def _forward_with_fallback(self, model_inputs: dict):
+        """Runs the model, and — ONLY on the very first call, when `self.model` is a
+        torch.compile-wrapped model — catches a Dynamo/compile runtime failure and
+        permanently swaps back to the eager model instead of crashing the whole run.
+        After the first successful (or recovered) call, this is just `self.model(...)`
+        with no extra overhead."""
+        if not self._compile_checked and self.model is not self._eager_model:
+            self._compile_checked = True
+            try:
+                return self.model(**model_inputs)
+            except Exception as e:
+                if self._is_main:
+                    print(f"  ! torch.compile broke on the first real batch ({e}) — "
+                          f"falling back to eager for the rest of this run")
+                self.model = self._eager_model
+                self.model.train()
+                return self.model(**model_inputs)
+        self._compile_checked = True
+        return self.model(**model_inputs)
+
     # ------------------------------------------------------------------ #
     def train(self):
         cfg = self.cfg
         self._init_wandb()
+        self._compile_checked = False
         step = self._start_step         # 0 unless resumed via load_checkpoint()
         self._cur_step = step
         self.model.train()
@@ -332,7 +357,7 @@ class Trainer:
                 batch = self._frame_drop_aug(batch)
 
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_bf16):
-                    out = self.model(**self._model_inputs(batch))
+                    out = self._forward_with_fallback(self._model_inputs(batch))
                     losses = self.loss_fn(out, batch)
                     loss = losses["loss"] / cfg.grad_accum
 

@@ -48,5 +48,7 @@ wandb_run_name: null
 
 # big-GPU speed
 num_workers: 8
-compile: true             # torch.compile — first step slow (compiling), then ~1.5-2x faster
+# torch.compile OFF — see configs/train_phase1_bigGPU.yaml's comment: real break on this
+# transformers version combining output_hidden_states + PEFT/LoRA under Dynamo.
+compile: false
 attn_implementation: "sdpa"   # or "flash_attention_2" if you `pip install flash-attn`

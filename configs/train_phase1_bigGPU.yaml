@@ -51,5 +51,14 @@ wandb_run_name: null
 
 # big-GPU speed
 num_workers: 8
-compile: true             # torch.compile — first step slow (compiling), then ~1.5-2x faster
+# torch.compile is OFF by default: real observed break on this transformers version —
+# it combines `output_hidden_states=True` (which this model needs) with PEFT/LoRA
+# wrapping via an internal "hidden states capture" hook, and Dynamo's graph-resume
+# breaks that hook (`KeyError: 'hidden_states'` deep in transformers/utils/generic.py).
+# Not a data/GPU issue — a library-version incompatibility. TF32 + bf16 + no grad-
+# checkpointing + batch 32 already give most of the big-GPU speedup without it. Try
+# `compile: true` again after a transformers upgrade if you want to chase the extra
+# ~1.5-2x — the trainer catches a compile-time failure, but NOT this runtime one, so
+# test it on a couple of steps before trusting a long run.
+compile: false
 attn_implementation: "sdpa"   # or "flash_attention_2" if you `pip install flash-attn`
