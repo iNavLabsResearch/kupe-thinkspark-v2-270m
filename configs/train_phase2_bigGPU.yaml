@@ -8,7 +8,7 @@ phase: 2
 base_model: "google/gemma-3-270m"
 hf_token_env: "HF_TOKEN"
 
-frames_dir: "data/frames_phase1"
+frames_dir: "data/frames"    # cosmetic only, unused at runtime — actual shard glob comes from --frames
 encoded_dir: "data/encoded"
 seq_len: 1024
 
