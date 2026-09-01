@@ -20,6 +20,7 @@ import warnings
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -31,6 +32,7 @@ from torch.utils.data import DataLoader
 warnings.filterwarnings("ignore", message=r".*torch\.cpu\.amp\.autocast.*")
 warnings.filterwarnings("ignore", message=r".*torch_dtype.*deprecated.*")
 
+from thinkspark import metrics as M
 from thinkspark import vocab
 from thinkspark.config import TrainConfig
 from thinkspark.dataset import ThinkSparkDataset, build_tokenizer, make_collate
@@ -275,6 +277,11 @@ class Trainer:
         self.model.eval()
         sums: dict[str, float] = {}
         n = 0
+        # Phase 2: also accumulate the control-flag confusion matrix, so validation
+        # reports the metric we actually care about (per-flag / macro F1) instead of only
+        # a loss that the text term dominates.
+        C = vocab.NUM_CONTROL_FLAGS
+        cm = np.zeros((C, C), dtype=np.int64) if self.cfg.phase == 2 else None
         for batch in loader:
             batch = self._to_device(batch)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_bf16):
@@ -283,12 +290,24 @@ class Trainer:
             for k, v in losses.items():
                 if hasattr(v, "item"):
                     sums[k] = sums.get(k, 0.0) + float(v.item())
+            if cm is not None:
+                pred = out.control_logits.argmax(-1).detach().cpu().numpy()
+                cm += M.flag_confusion(pred,
+                                       batch["flags"].detach().cpu().numpy(),
+                                       batch["audio_mask"].detach().cpu().numpy())
             n += 1
         if was_training:
             self.model.train()
         if n == 0:
             return {}
         avg = {k: v / n for k, v in sums.items()}
+        if cm is not None and cm.sum() > 0:
+            per_flag = M.per_flag_f1(cm)
+            avg["ctrl_macro_f1"] = float(np.mean([f1 for _, _, f1 in per_flag.values()]))
+            avg["barge_f1"] = float(M.barge_metrics(cm, 0, 1).f1)
+            self._last_per_flag = per_flag
+            self._wandb_log({f"{split}/f1/{flag}": f1
+                             for flag, (_, _, f1) in per_flag.items()}, step)
         pretty = " ".join(f"{k}={v:.4f}" for k, v in avg.items())
         print(f"  [eval:{split}] step {step}: {pretty}")
         self._wandb_log({f"{split}/{k}": v for k, v in avg.items()}, step)
@@ -299,26 +318,40 @@ class Trainer:
         """Given a just-computed validation metric dict, (re)write the `best/` checkpoint
         when val loss improves and drive early stopping. Main process only. No-op if the
         val loader was empty (val_avg has no 'loss')."""
-        if not self._is_main or not val_avg or "loss" not in val_avg:
+        if not self._is_main or not val_avg:
             return
         cfg = self.cfg
-        val_loss = float(val_avg["loss"])
+        # Which metric decides "best". "ctrl_macro_f1" is HIGHER-is-better, so it is
+        # negated into the same minimize-me convention as the loss.
+        name = getattr(cfg, "best_metric", "loss")
+        if name not in val_avg:
+            if name != "loss":
+                print(f"  ! best_metric '{name}' not in val metrics — falling back to loss")
+            name = "loss"
+        if name not in val_avg:
+            return
+        raw = float(val_avg[name])
+        higher_better = name.endswith("f1")
+        score = -raw if higher_better else raw     # always minimize `score`
         min_delta = getattr(cfg, "early_stop_min_delta", 0.0)
-        improved = val_loss < (self._best_val - min_delta)
+        improved = score < (self._best_val - min_delta)
         if improved:
-            self._best_val = val_loss
+            self._best_val = score
             self._best_step = step
+            self._best_raw = raw
+            self._best_metric_name = name
             self._evals_no_improve = 0
             if getattr(cfg, "save_best", True):
                 self.save("best")
-                print(f"  ↳ new best val loss {val_loss:.4f} @ step {step} — saved best/")
-            self._wandb_log({"val/best_loss": val_loss, "val/best_step": step}, step)
+                print(f"  ↳ new best val {name} {raw:.4f} @ step {step} — saved best/")
+            self._wandb_log({f"val/best_{name}": raw, "val/best_step": step}, step)
         else:
             self._evals_no_improve += 1
             patience = getattr(cfg, "early_stop_patience", 0)
             if patience > 0:
                 print(f"  ↳ no val improvement ({self._evals_no_improve}/{patience}); "
-                      f"best {self._best_val:.4f} @ step {self._best_step}")
+                      f"best {name}={getattr(self, '_best_raw', float('nan')):.4f} "
+                      f"@ step {self._best_step}")
                 if self._evals_no_improve >= patience:
                     print(f"  ↳ early stopping: {patience} evals without improvement. "
                           f"Best checkpoint is best/ (step {self._best_step}).")
@@ -451,8 +484,9 @@ class Trainer:
             self.save("final")
             if self._best_step >= 0:
                 print(f"\n  ** BEST checkpoint: {self.out_dir / 'best'} "
-                      f"(val loss {self._best_val:.4f} @ step {self._best_step}). "
-                      f"Evaluate THIS, not final/. **")
+                      f"(val {getattr(self, '_best_metric_name', 'loss')}="
+                      f"{getattr(self, '_best_raw', float('nan')):.4f} @ step "
+                      f"{self._best_step}). Evaluate THIS, not final/. **")
             # final held-out TEST eval — the honest generalization number
             self.evaluate(self.test_loader, "test", self._cur_step)
             self._join_uploads()   # let any background checkpoint uploads finish

@@ -41,6 +41,7 @@ ROOT = setup()
 from thinkspark.config import TrainConfig
 from thinkspark.trainer import Trainer
 from thinkspark.train_runs import add_run_args, wire_run
+from thinkspark.warmstart import remap_phase1_state_dict, report_load
 
 
 def main():
@@ -68,9 +69,13 @@ def main():
     if args.init and not resumed:
         state = torch.load(args.init, map_location=trainer.device)
         model = trainer.model.module if trainer.ddp else trainer.model
+        # A LoRA-trained Phase-1 checkpoint has PEFT-wrapped keys that match NOTHING in a
+        # full-finetune Phase-2 model; strict=False used to swallow that and train from
+        # base Gemma. Remap (merging any LoRA deltas) and then verify the load loudly.
+        state = remap_phase1_state_dict(state, lora_alpha=cfg.lora_alpha,
+                                        lora_r=cfg.lora_r)
         missing, unexpected = model.load_state_dict(state, strict=False)
-        print(f"warm-started from {args.init} "
-              f"(missing={len(missing)}, unexpected={len(unexpected)})")
+        report_load(missing, unexpected, len(model.state_dict()), source=args.init)
     elif args.init and resumed:
         print(f"ignoring --init (resuming run {run_id} from its own checkpoint instead)")
 

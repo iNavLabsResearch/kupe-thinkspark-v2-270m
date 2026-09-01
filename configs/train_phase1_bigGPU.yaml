@@ -33,12 +33,26 @@ grad_checkpointing: false # OFF on a big GPU = much faster (you have the VRAM)
 frame_drop_aug: 0.05
 label_smoothing: 0.0
 
-use_lora: true
+# FULL fine-tune, NOT LoRA. Two reasons, both learned the hard way:
+#   1. A 270M model full-finetunes in a few GB on a 96GB card — LoRA was only ever here
+#      for the 24GB L4 / 2xT4 path. There is no memory reason to accept its lower capacity.
+#   2. LoRA here silently BROKE the Phase-1 -> Phase-2 handoff: peft renames every
+#      backbone key (backbone.base_model.model.model.layers...), Phase 2 is a full
+#      finetune expecting plain keys (backbone.model.layers...), and its
+#      load_state_dict(strict=False) matched almost nothing — reported only as
+#      "missing=237, unexpected=489". Phase 2 trained from base Gemma and threw away all
+#      of Phase 1. Full-finetuning both phases makes the key layouts identical.
+use_lora: false
 lora_r: 16
 lora_alpha: 32
 lora_dropout: 0.05
 
-lambda_vap: 0.3
+# VAP aux weight. Was 0.3, which made VAP ~0.2% of the total loss (L_align is ~2.5 nats
+# while L_vap is ~0.02), so the VAP head was effectively never trained — which is exactly
+# why evaluation reported VAD-F1 = 0.000. 5.0 puts it at a real fraction of the gradient.
+# NOTE: if scripts/25_check_data.py reports a near-zero speaking rate, the VAP TARGETS are
+# degenerate and no loss weight will fix it — fix the frame data first.
+lambda_vap: 5.0
 vap_horizon: 25
 
 out_dir: "artifacts/thinkspark-v2-350m/phase1"
@@ -50,7 +64,10 @@ ddp: false                # multi-GPU: set true and launch with torchrun --nproc
 # eval splits + W&B
 val_frac: 0.02
 test_frac: 0.01
-eval_every: 500
+eval_every: 250
+save_best: true            # keep best/ at the min val loss — warm-start Phase 2 from THIS
+early_stop_patience: 6     # stop after 6 evals with no val gain (0 = off)
+early_stop_min_delta: 0.0
 wandb_project: "kupe-thinkspark-270m"
 wandb_entity: null
 wandb_run_name: null

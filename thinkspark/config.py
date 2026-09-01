@@ -212,6 +212,13 @@ class TrainConfig:
     save_best: bool = True               # keep a `best/` checkpoint at the min val loss
     early_stop_patience: int = 0         # evals w/o val improvement before stopping (0 = off)
     early_stop_min_delta: float = 0.0    # min val-loss decrease to count as an improvement
+    # WHICH validation metric decides "best" and drives early stopping.
+    #   "loss"          — total weighted val loss (lower better). Fine for Phase 1.
+    #   "ctrl_macro_f1" — macro-averaged control-flag F1 (HIGHER better). The right
+    #                     choice for Phase 2: the total loss there is dominated by the
+    #                     text term, so selecting on it picks the best TEXT model, not
+    #                     the best REFEREE — which is the thing being evaluated.
+    best_metric: str = "loss"
     # Weights & Biases (optional) — set wandb_project (or WANDB_PROJECT env) to enable.
     # Needs `pip install wandb` + WANDB_API_KEY in env (or `wandb login`). Logs train/val
     # loss + every component, LR, per-epoch summaries, and a final test eval, all charted.

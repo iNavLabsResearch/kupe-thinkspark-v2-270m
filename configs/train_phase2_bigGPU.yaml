@@ -43,11 +43,26 @@ lora_r: 16
 lora_alpha: 32
 lora_dropout: 0.05
 
-# L_P2 = l_ctrl*L_ctrl + l_txt*L_txt + l_vap*L_vap   (Section 9.1)
-lambda_ctrl: 1.0
-lambda_txt: 0.5
-lambda_vap_p2: 0.3        # was 0.2 (default) — a touch more VAP weight; last run's VAP
-                          # head never fired (VAD-F1 0.000), so give it more signal
+# L_P2 = l_ctrl*L_ctrl + l_txt*L_txt + l_vap*L_vap
+#
+# THE most important numbers in this file. The guide's nominal (1.0, 0.5, 0.2) assumes the
+# three terms are on comparable scales. They are NOT. Measured from a real run at step 680:
+#
+#     ctrl=0.0079  txt=2.3339  vap=0.0200
+#     -> 1.0*0.0079 = 0.0079  =  0.67% of the loss
+#     -> 0.5*2.3339 = 1.1669  = 98.82% of the loss   <-- text ate everything
+#     -> 0.3*0.0200 = 0.0060  =  0.51% of the loss
+#
+# The control head — the ENTIRE point of a referee model — was getting 0.67% of the
+# gradient. That is why TURN_END scored F1=0.20, BARGE_SOFT F1=0.05, COMMIT_LLM F1=0.09:
+# those heads were never meaningfully trained. Focal loss makes it worse by design (it
+# down-weights the easy majority frames toward zero), so its absolute value stays tiny.
+#
+# Rebalanced so control DOMINATES and text is the auxiliary it should be:
+#     20.0*0.008 = 0.16   (~41%)     0.1*2.33 = 0.23   (~59%)
+lambda_ctrl: 20.0         # was 1.0
+lambda_txt: 0.1           # was 0.5 — back-channel text is secondary to the flags
+lambda_vap_p2: 1.0        # was 0.2 — VAP head never fired (VAD-F1 0.000)
 focal_gamma: 2.0
 vap_horizon: 25
 
@@ -60,9 +75,14 @@ ddp: false                # multi-GPU: set true and launch with torchrun --nproc
 # eval splits + best-checkpoint tracking + early stopping
 val_frac: 0.02
 test_frac: 0.01
-eval_every: 250           # finer-grained so best/ and early stop catch the real minimum
-save_best: true           # write best/ at the min val loss — EVALUATE best/, not final/
-early_stop_patience: 4    # stop after 4 consecutive evals (=1000 steps) with no val gain
+eval_every: 100           # ~286 steps/epoch, so this gives ~11 evals over the run —
+                          # enough resolution for best/ to catch the real optimum
+save_best: true           # write best/ at the best metric — EVALUATE best/, not final/
+# Select on the REFEREE's quality, not the total loss. The total loss is dominated by the
+# text term even after rebalancing, so "min val loss" picks the best text model. Macro F1
+# over the 11 control flags is what scripts/08_evaluate.py actually grades.
+best_metric: "ctrl_macro_f1"
+early_stop_patience: 6    # stop after 6 evals (=600 steps) with no macro-F1 gain
 early_stop_min_delta: 0.0
 
 # W&B

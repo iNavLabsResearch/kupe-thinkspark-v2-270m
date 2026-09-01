@@ -25,12 +25,21 @@ precision: "bf16"
 grad_checkpointing: true
 frame_drop_aug: 0.05
 
-use_lora: true            # Phase 1 uses LoRA / partial unfreeze
+# FULL fine-tune, NOT LoRA — same as configs/train_phase1_bigGPU.yaml. A 270M model in
+# bf16 full-finetunes inside 24GB with batch 4 + grad checkpointing (Phase 2 has always
+# done exactly that). LoRA here silently broke the Phase-1 -> Phase-2 handoff: peft
+# renames every backbone key, Phase 2 expects plain keys, and its
+# load_state_dict(strict=False) matched almost nothing — logged only as
+# "missing=237, unexpected=489" while Phase 2 restarted from base Gemma. Keeping both
+# phases full-finetune makes the key layouts identical and the handoff verifiable.
+use_lora: false
 lora_r: 16
 lora_alpha: 32
 lora_dropout: 0.05
 
-lambda_vap: 0.3           # L_P1 = L_align + 0.3 * L_vap
+lambda_vap: 5.0           # L_P1 = L_align + 5.0 * L_vap. Was 0.3, which left VAP at ~0.2%
+                          # of the loss (L_align ~2.5 nats vs L_vap ~0.02) — the VAP head
+                          # was never trained, hence VAD-F1 = 0.000 at eval.
 vap_horizon: 25           # ~2 s of future 80 ms bins
 
 out_dir: "artifacts/thinkspark-v2-350m/phase1"
