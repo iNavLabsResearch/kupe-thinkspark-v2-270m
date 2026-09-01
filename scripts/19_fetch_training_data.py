@@ -342,7 +342,8 @@ def main():
             _dry_run_report(args.phase1_repo, patterns, token, "phase1")
         if args.phase2_repo:
             _dry_run_report(args.phase2_repo,
-                            ["scenarios/scenarios_all.jsonl", "audio/**/*.wav", "timestamps/**/*.json"],
+                            ["data/phase2-shard-*.parquet", "scenarios/scenarios_all.jsonl",
+                             "audio/**/*.wav", "timestamps/**/*.json"],
                             token, "phase2")
         print("\ndry run — nothing downloaded. Re-run without --dry-run to fetch.")
         return
