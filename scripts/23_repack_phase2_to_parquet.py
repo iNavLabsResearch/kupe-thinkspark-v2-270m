@@ -65,9 +65,16 @@ def _load_scenarios(api, repo: str, token: str | None, tmp_dir: Path) -> dict[st
     from huggingface_hub import hf_hub_download
 
     print("downloading scenarios/scenarios_all.jsonl (full schema, needed once)...")
-    path = hf_hub_download(repo_id=repo, repo_type="dataset", token=token,
-                           filename="scenarios/scenarios_all.jsonl",
-                           local_dir=str(tmp_dir))
+    try:
+        path = hf_hub_download(repo_id=repo, repo_type="dataset", token=token,
+                               filename="scenarios/scenarios_all.jsonl",
+                               local_dir=str(tmp_dir))
+    except Exception as e:
+        print(f"  ! no scenarios/scenarios_all.jsonl on {repo} ({e}) — this repo predates "
+             f"the full-schema upload (scripts/13_upload_hf.py). Every wav will be "
+             f"skipped as orphaned (no scenario record to pair it with) unless you "
+             f"re-upload scenarios/scenarios_all.jsonl to this repo first.")
+        return {}
     out: dict[str, str] = {}
     with open(path, encoding="utf-8") as f:
         for line in f:
