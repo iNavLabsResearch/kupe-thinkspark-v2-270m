@@ -85,11 +85,16 @@ def main():
     # layers mismatch dtype (real error: "expected mat1 and mat2 to have the same dtype,
     # but got: float != c10::BFloat16"). Match training's precision exactly.
     use_bf16 = device == "cuda"
+    # MUST match thinkspark.trainer._model_inputs. Omitting spoken_ids/spoken_mask
+    # builds a sequence with NO spoken tail, so lm_logits covers only [text+audio] while
+    # the labels still mark the tail positions; spoken_ce_loss then shifts logits against
+    # the wrong labels (the shapes coincidentally match, so nothing raises) and returns a
+    # meaningless CE — observed 17.76 for a checkpoint whose true val align was 3.18.
     keys = ["text_ids", "text_seg", "text_mask", "cb0", "prosody",
-            "agent_state", "audio_mask"]
+            "agent_state", "audio_mask", "spoken_ids", "spoken_mask"]
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
         for batch in loader:
-            inp = {k: batch[k].to(device) for k in keys}
+            inp = {k: batch[k].to(device) for k in keys if k in batch}
             t0 = time.perf_counter()
             out = model(**inp)
             decode_ms.append((time.perf_counter() - t0) * 1000.0 / inp["cb0"].shape[0])

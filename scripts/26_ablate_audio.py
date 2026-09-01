@@ -75,8 +75,13 @@ def main():
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
                         collate_fn=make_collate(tok.pad_token_id, phase=cfg.phase))
 
+    # MUST match thinkspark.trainer._model_inputs. Omitting spoken_ids/spoken_mask
+    # builds a sequence with NO spoken tail, so lm_logits covers only [text+audio] while
+    # the labels still mark the tail positions; spoken_ce_loss then shifts logits against
+    # the wrong labels (the shapes coincidentally match, so nothing raises) and returns a
+    # meaningless CE — observed 17.76 for a checkpoint whose true val align was 3.18.
     keys = ["text_ids", "text_seg", "text_mask", "cb0", "prosody",
-            "agent_state", "audio_mask"]
+            "agent_state", "audio_mask", "spoken_ids", "spoken_mask"]
     use_bf16 = device == "cuda"
     intact, ablated = [], []
 
@@ -84,7 +89,7 @@ def main():
         for i, batch in enumerate(loader):
             if i >= args.max_batches:
                 break
-            inp = {k: batch[k].to(device) for k in keys}
+            inp = {k: batch[k].to(device) for k in keys if k in batch}
             labels = batch["align_labels"].to(device)
 
             out = model(**inp)
@@ -106,7 +111,14 @@ def main():
     print(f"  ablated  CE={ce_a:.4f}   perplexity={ppl_a:8.2f}")
     print(f"  delta    CE={ce_a-ce_i:+.4f}  ({100*(ppl_a-ppl_i)/max(ppl_i,1e-9):+.1f}% perplexity)")
     print()
-    if ce_a - ce_i < 0.05:
+    if ce_i > 8.0:
+        print("  ! SUSPECT: intact CE is far above what training reported for this")
+        print("    checkpoint. That points at a harness bug in THIS script (wrong model")
+        print("    inputs / label alignment), not at the model. Do not read the verdict.")
+    elif ce_a - ce_i < -0.05:
+        print("  ! SUSPECT: ablating the audio IMPROVED the loss, which is not possible")
+        print("    for a model that uses it. Treat this as a bug in this script.")
+    elif ce_a - ce_i < 0.05:
         print("  ✗ THE AUDIO IS BEING IGNORED. Removing it barely changes the loss, so the")
         print("    model is scoring on a text prior alone. Phase-1 modality alignment did")
         print("    NOT happen — more epochs will not fix this.")
