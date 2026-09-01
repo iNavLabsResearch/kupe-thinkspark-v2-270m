@@ -203,6 +203,15 @@ class TrainConfig:
     val_frac: float = 0.02               # held out from training for validation
     test_frac: float = 0.01              # held out for a single final test eval
     eval_every: int = 500                # steps between validation evals (also runs each epoch end)
+    # Best-checkpoint tracking + early stopping (keyed off val loss). Solves the "train
+    # loss keeps dropping but val loss turns back up, and I kept the overfit last
+    # checkpoint" problem: whenever a val eval improves on the best-so-far, the trainer
+    # (re)writes a `best/` checkpoint, so you always have the true generalization optimum
+    # regardless of where the run stops. If `early_stop_patience > 0`, the run halts after
+    # that many CONSECUTIVE val evals with no improvement (> min_delta).
+    save_best: bool = True               # keep a `best/` checkpoint at the min val loss
+    early_stop_patience: int = 0         # evals w/o val improvement before stopping (0 = off)
+    early_stop_min_delta: float = 0.0    # min val-loss decrease to count as an improvement
     # Weights & Biases (optional) — set wandb_project (or WANDB_PROJECT env) to enable.
     # Needs `pip install wandb` + WANDB_API_KEY in env (or `wandb login`). Logs train/val
     # loss + every component, LR, per-epoch summaries, and a final test eval, all charted.

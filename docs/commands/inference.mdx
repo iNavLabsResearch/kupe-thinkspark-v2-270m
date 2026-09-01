@@ -34,6 +34,41 @@ referee decode p50/p95 = 6.1 / 14.8 ms (target p95 <= 80 ms frame budget)
 Each line is `agent-state -> control flag (-> spoken text if any)`, exactly what the
 orchestrator would see frame-by-frame in production.
 
+## Live microphone (continuous, real hardware)
+
+`scripts/24_infer_mic.py` is the real-mic counterpart to the demo above — same
+`StreamingReferee` + `ReferenceOrchestrator` loop, fed from your actual microphone
+instead of a pre-rendered `.npz`. It downloads the checkpoint from the HF model repo
+automatically if you point it at a run id instead of a local path, listens continuously,
+prints every non-trivial decision live, and appends **every** frame's decision to a JSONL
+log file so nothing is lost even if you're not watching the terminal.
+
+```bash
+pip install sounddevice   # only extra dep beyond training requirements
+export HF_TOKEN=hf_...
+
+# pulls the checkpoint from HF if not already local:
+python scripts/24_infer_mic.py --run-id 20260901-185848 --tag step1500
+
+# or skip the download, point straight at a local checkpoint:
+python scripts/24_infer_mic.py \
+    --ckpt artifacts/thinkspark-v2-350m/phase2/runs/20260901-185848/step1500
+```
+
+Stop with `Ctrl+C`. Log format (`reports/mic_session.jsonl` by default, one JSON object
+per 80 ms frame):
+```json
+{"ts": 1767289012.4, "flag": "BARGE_HARD", "spoken": "", "decode_ms": 7.2}
+{"ts": 1767289012.5, "flag": "LISTEN", "spoken": "", "decode_ms": 6.8}
+```
+
+<Note>
+This re-encodes a short trailing window per chunk (same reference-quality tradeoff as the
+file-based demo, see the frame-budget section below) — not a KV-cache production stream.
+`agent_state` is fixed via `--start-state` for this standalone listening tool; your real
+orchestrator would drive it from its own TTS/LLM state machine instead.
+</Note>
+
 ## Wiring it into your own SDK / LiveKit / Pipecat
 
 `thinkspark.inference.StreamingReferee` + `ReferenceOrchestrator` are the two classes to

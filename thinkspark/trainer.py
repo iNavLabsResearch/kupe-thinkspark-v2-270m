@@ -139,7 +139,8 @@ class Trainer:
             alpha = class_alpha_from_freq(_class_frequency(shard_paths))
             self.loss_fn = Phase2Loss(alpha=alpha, gamma=cfg.focal_gamma,
                                       l_ctrl=cfg.lambda_ctrl, l_txt=cfg.lambda_txt,
-                                      l_vap=cfg.lambda_vap_p2)
+                                      l_vap=cfg.lambda_vap_p2,
+                                      label_smoothing=getattr(cfg, "label_smoothing", 0.0))
         self.loss_fn = self.loss_fn.to(self.device)
 
         # data — split into train / val / test (val + test held OUT of training so their
@@ -223,6 +224,12 @@ class Trainer:
         self.run_id = None       # set by thinkspark.train_runs.wire_run (used as wandb name)
         self._wandb = None       # lazily initialized in train() on the main process
 
+        # best-val checkpoint + early-stop bookkeeping (see _track_best / config knobs)
+        self._best_val = float("inf")
+        self._best_step = -1
+        self._evals_no_improve = 0
+        self._should_stop = False
+
     # ------------------------------------------------------------------ #
     def _init_wandb(self):
         """Start a Weights & Biases run if configured (main process only). No-op if
@@ -286,6 +293,36 @@ class Trainer:
         print(f"  [eval:{split}] step {step}: {pretty}")
         self._wandb_log({f"{split}/{k}": v for k, v in avg.items()}, step)
         return avg
+
+    # ------------------------------------------------------------------ #
+    def _track_best(self, val_avg: dict, step: int) -> None:
+        """Given a just-computed validation metric dict, (re)write the `best/` checkpoint
+        when val loss improves and drive early stopping. Main process only. No-op if the
+        val loader was empty (val_avg has no 'loss')."""
+        if not self._is_main or not val_avg or "loss" not in val_avg:
+            return
+        cfg = self.cfg
+        val_loss = float(val_avg["loss"])
+        min_delta = getattr(cfg, "early_stop_min_delta", 0.0)
+        improved = val_loss < (self._best_val - min_delta)
+        if improved:
+            self._best_val = val_loss
+            self._best_step = step
+            self._evals_no_improve = 0
+            if getattr(cfg, "save_best", True):
+                self.save("best")
+                print(f"  ↳ new best val loss {val_loss:.4f} @ step {step} — saved best/")
+            self._wandb_log({"val/best_loss": val_loss, "val/best_step": step}, step)
+        else:
+            self._evals_no_improve += 1
+            patience = getattr(cfg, "early_stop_patience", 0)
+            if patience > 0:
+                print(f"  ↳ no val improvement ({self._evals_no_improve}/{patience}); "
+                      f"best {self._best_val:.4f} @ step {self._best_step}")
+                if self._evals_no_improve >= patience:
+                    print(f"  ↳ early stopping: {patience} evals without improvement. "
+                          f"Best checkpoint is best/ (step {self._best_step}).")
+                    self._should_stop = True
 
     # ------------------------------------------------------------------ #
     def load_checkpoint(self, ckpt_dir: Path) -> None:
@@ -385,14 +422,24 @@ class Trainer:
                         self._log(epoch, step, {k: v / n_accum for k, v in accum.items()}, lr)
                     accum, n_accum = {}, 0
                     if self._is_main and step % getattr(cfg, "eval_every", 500) == 0:
-                        self.evaluate(self.val_loader, "val", step)
+                        val_avg = self.evaluate(self.val_loader, "val", step)
+                        self._track_best(val_avg, step)
                     if self._is_main and step % cfg.save_every == 0:
                         self.save(f"step{step}")
+                if self._should_stop:
+                    break
             # end-of-epoch validation summary
             if self._is_main:
-                self.evaluate(self.val_loader, "val", step)
+                val_avg = self.evaluate(self.val_loader, "val", step)
+                self._track_best(val_avg, step)
+            if self._should_stop:
+                break
         if self._is_main:
             self.save("final")
+            if self._best_step >= 0:
+                print(f"\n  ** BEST checkpoint: {self.out_dir / 'best'} "
+                      f"(val loss {self._best_val:.4f} @ step {self._best_step}). "
+                      f"Evaluate THIS, not final/. **")
             # final held-out TEST eval — the honest generalization number
             self.evaluate(self.test_loader, "test", self._cur_step)
             if self._wandb is not None:

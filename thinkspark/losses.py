@@ -125,19 +125,25 @@ class Phase2Loss(nn.Module):
     """L_P2 = l1*L_ctrl + l2*L_txt + l3*L_vap."""
 
     def __init__(self, alpha: torch.Tensor | None = None, gamma: float = 2.0,
-                 l_ctrl: float = 1.0, l_txt: float = 0.5, l_vap: float = 0.2):
+                 l_ctrl: float = 1.0, l_txt: float = 0.5, l_vap: float = 0.2,
+                 label_smoothing: float = 0.0):
         super().__init__()
         self.register_buffer("alpha", alpha if alpha is not None
                              else torch.ones(vocab.NUM_CONTROL_FLAGS))
         self.gamma = gamma
         self.l_ctrl, self.l_txt, self.l_vap = l_ctrl, l_txt, l_vap
+        # Applied to the spoken-text CE only. A small value (0.05-0.1) is a cheap,
+        # effective regularizer against the Phase-2 text head memorizing the synthetic
+        # back-channel corpus (a real driver of the val/txt overfit turn-up).
+        self.label_smoothing = label_smoothing
 
     def forward(self, out, batch) -> dict[str, torch.Tensor]:
         l_ctrl = focal_control_loss(
             out.control_logits, batch["flags"], batch["audio_mask"],
             alpha=self.alpha, gamma=self.gamma,
         )
-        l_txt = spoken_ce_loss(out.lm_logits, batch["spoken_labels"])
+        l_txt = spoken_ce_loss(out.lm_logits, batch["spoken_labels"],
+                               label_smoothing=self.label_smoothing)
         l_vap = vap_bce_loss(out.vap_logits, batch["vap"], batch["audio_mask"])
         total = self.l_ctrl * l_ctrl + self.l_txt * l_txt + self.l_vap * l_vap
         return {"loss": total, "ctrl": l_ctrl.detach(),

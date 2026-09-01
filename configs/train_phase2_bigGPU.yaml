@@ -1,8 +1,18 @@
-# Same recipe as configs/train_phase1.yaml, but sized for lots of VRAM + speed:
-#   - big real batch (32) with little/no grad accumulation
-#   - gradient checkpointing OFF (you have the memory; this is much faster)
-#   - torch.compile ON, more dataloader workers
-# On a 24GB L4 use configs/train_phase1.yaml instead (batch 4, grad_accum 16, checkpointing on).
+# Phase-2 referee fine-tune, sized for a big single GPU (RTX PRO 6000 Blackwell, 96 GB)
+# and tuned to STOP BEFORE OVERFITTING.
+#
+# Why this differs from the previous version of this file:
+#   Your last run (4 epochs, no smoothing, no best-checkpoint tracking) hit its val-loss
+#   minimum around step ~800 (~2 epochs) and then val/loss + val/txt climbed back up while
+#   train/loss kept dropping — textbook overfit — and you ended up evaluating the LAST
+#   (worst) checkpoint. The changes below fix that at the recipe level:
+#     - epochs 4 -> 3, but early stopping ends the run once val stops improving
+#     - save_best keeps a `best/` checkpoint at the val-loss minimum (evaluate THAT)
+#     - eval_every 500 -> 250 so best/ + early stop are fine-grained
+#     - label_smoothing 0.1 regularizes the spoken-text CE (now wired into Phase2Loss)
+#     - weight_decay 0.1 kept; frame_drop_aug 0.05 kept
+#
+# On a 24 GB L4 use configs/train_phase2.yaml instead (batch 4, grad_accum 16, checkpointing on).
 
 phase: 2
 base_model: "google/gemma-3-270m"
@@ -18,21 +28,28 @@ adam_beta1: 0.9
 adam_beta2: 0.95
 lr: 1.0e-4                 # Phase-2 LR
 warmup_ratio: 0.03
-batch_size: 48            # tail-only LM head frees VRAM (see thinkspark/model.py); 48 fits
-                          # an 80GB H100. Drop to 32 if you OOM (Phase-2 is a full finetune,
-                          # heavier than Phase-1's LoRA).
-grad_accum: 1             # effective batch 48
-epochs: 4                 # Phase-2 referee = 3-5 epochs (smaller ~55h corpus, needs more passes)
+batch_size: 64            # tail-only LM head keeps VRAM modest; 64 fits comfortably in
+                          # 96 GB. Drop to 48/32 only if you OOM.
+grad_accum: 1             # effective batch 64
+epochs: 3                 # upper bound — early stopping usually ends it sooner (val
+                          # minimum last time was ~2 epochs in)
 precision: "bf16"
 grad_checkpointing: false # OFF on a big GPU = much faster (you have the VRAM)
 frame_drop_aug: 0.05
-label_smoothing: 0.0
+label_smoothing: 0.1      # regularizes the spoken-text CE (a driver of the val/txt turn-up)
 
 use_lora: false
 lora_r: 16
 lora_alpha: 32
 lora_dropout: 0.05
 
+# L_P2 = l_ctrl*L_ctrl + l_txt*L_txt + l_vap*L_vap   (Section 9.1)
+lambda_ctrl: 1.0
+lambda_txt: 0.5
+lambda_vap_p2: 0.3        # was 0.2 (default) — a touch more VAP weight; last run's VAP
+                          # head never fired (VAD-F1 0.000), so give it more signal
+focal_gamma: 2.0
+vap_horizon: 25
 
 out_dir: "artifacts/thinkspark-v2-350m/phase2"
 log_every: 20
@@ -40,17 +57,20 @@ save_every: 500
 seed: 1234
 ddp: false                # multi-GPU: set true and launch with torchrun --nproc_per_node=N
 
-# eval splits + W&B
+# eval splits + best-checkpoint tracking + early stopping
 val_frac: 0.02
 test_frac: 0.01
-eval_every: 500
+eval_every: 250           # finer-grained so best/ and early stop catch the real minimum
+save_best: true           # write best/ at the min val loss — EVALUATE best/, not final/
+early_stop_patience: 4    # stop after 4 consecutive evals (=1000 steps) with no val gain
+early_stop_min_delta: 0.0
+
+# W&B
 wandb_project: "kupe-thinkspark-270m"
 wandb_entity: null
 wandb_run_name: null
 
 # big-GPU speed
 num_workers: 8
-# torch.compile OFF — see configs/train_phase1_bigGPU.yaml's comment: real break on this
-# transformers version combining output_hidden_states + PEFT/LoRA under Dynamo.
-compile: false
+compile: false                # see train_phase1_bigGPU.yaml comment (Dynamo + PEFT/hidden_states break)
 attn_implementation: "sdpa"   # or "flash_attention_2" if you `pip install flash-attn`

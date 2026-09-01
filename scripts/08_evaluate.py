@@ -52,6 +52,10 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--frames", required=True)
     ap.add_argument("--report-out", default="reports/eval.json")
+    ap.add_argument("--wandb-run-id", default=None,
+                    help="log these results into an EXISTING W&B run (e.g. the training "
+                        "run this checkpoint came from) instead of a new one — pass the "
+                        "run id shown in the training logs, e.g. 20260901-185848")
     args = ap.parse_args()
 
     cfg = TrainConfig.from_yaml(ROOT / args.config)
@@ -70,6 +74,7 @@ def main():
     cm = np.zeros((C, C), dtype=np.int64)
     decode_ms: list[float] = []
     pred_speaking, true_speaking = [], []
+    vap_logit_pos: list = []   # raw next-frame VAP logits (for the threshold sweep)
 
     # Training runs every forward pass under bf16 autocast (thinkspark/trainer.py), which
     # casts activations on the fly — the backbone itself loads bf16 (thinkspark/model.py)
@@ -92,14 +97,39 @@ def main():
             mask = batch["audio_mask"].numpy()
             cm += M.flag_confusion(pred, true, mask)
 
-            vap_pred = (out.vap_logits[..., 0] > 0).cpu().numpy()   # next-frame speaking
+            vap_logit = out.vap_logits[..., 0].float().cpu().numpy()   # next-frame logit
+            vap_pred = (vap_logit > 0)                                 # speaking @ prob>0.5
             vap_true = (batch["vap"][..., 0].numpy() > 0.5)
             m = mask.astype(bool)
             pred_speaking.append(vap_pred[m]); true_speaking.append(vap_true[m])
+            vap_logit_pos.append(vap_logit[m])
 
     per_flag = M.per_flag_f1(cm)
     barge = M.barge_metrics(cm, backchannel_frames_pred_barge=0, backchannel_frames_total=1)
     vad = M.vad_f1(np.concatenate(pred_speaking), np.concatenate(true_speaking)) if pred_speaking else 0.0
+
+    # VAD diagnostics — a VAD-F1 of 0.000 is almost always one of two things, and these
+    # numbers tell you which: (a) the VAP head is dead / never fires (pred positive rate
+    # ~0) so there are zero true positives, or (b) the fixed >0-logit (prob>0.5) threshold
+    # is simply miscalibrated for this head. We report the true/pred base rates plus the
+    # best F1 over a logit-threshold sweep, so you can see whether the signal exists at all.
+    vad_diag = None
+    if pred_speaking:
+        tp_all = np.concatenate(true_speaking).astype(bool)
+        pp_all = np.concatenate(pred_speaking).astype(bool)   # at the default >0 threshold
+        best_f1, best_thr = vad, 0.0
+        if vap_logit_pos:
+            logits_all = np.concatenate(vap_logit_pos)
+            for thr in np.quantile(logits_all, np.linspace(0.02, 0.98, 25)):
+                f1 = M.vad_f1((logits_all > thr), tp_all)
+                if f1 > best_f1:
+                    best_f1, best_thr = f1, float(thr)
+        vad_diag = {
+            "true_speaking_rate": float(tp_all.mean()),
+            "pred_speaking_rate": float(pp_all.mean()),
+            "best_threshold_f1": round(float(best_f1), 3),
+            "best_threshold": round(float(best_thr), 3),
+        }
     # decode latency is per-batch/B; report percentiles
     lat = M.latency_percentiles(decode_ms)
 
@@ -110,6 +140,7 @@ def main():
         "latency_p50_ms": lat["p50"],
         "latency_p95_ms": lat["p95"],
         "per_flag_f1": {k: round(v[2], 3) for k, v in per_flag.items()},
+        "vad_diag": vad_diag,
     }
     passed = M.check_targets(results)
 
@@ -119,6 +150,15 @@ def main():
     print(f"VAD-F1            : {vad:.3f}   (target >= 0.85)  {'PASS' if passed.get('vad_f1') else 'x'}")
     print(f"Barge-in F1       : {barge.f1:.3f}   (target >= 0.85)  {'PASS' if passed.get('barge_f1') else 'x'}")
     print(f"Latency p50/p95   : {lat['p50']:.1f} / {lat['p95']:.1f} ms   (p95 target <= 40)")
+    if vad_diag is not None:
+        print(f"VAD diag          : true_speak={vad_diag['true_speaking_rate']:.3f} "
+              f"pred_speak={vad_diag['pred_speaking_rate']:.3f} "
+              f"| best-threshold F1={vad_diag['best_threshold_f1']:.3f} "
+              f"@ logit>{vad_diag['best_threshold']:.2f}")
+        if vad_diag["pred_speaking_rate"] < 1e-4 and vad_diag["true_speaking_rate"] > 0.05:
+            print("  → VAP head never predicts 'speaking' at the default threshold: the "
+                  "head is under-trained (raise lambda_vap_p2) or the >0-logit threshold "
+                  "is miscalibrated (use the best-threshold F1 above).")
     print("\nper-flag F1:")
     for flag, (p, r, f1) in per_flag.items():
         print(f"  {flag:<14} P={p:.2f} R={r:.2f} F1={f1:.2f}")
@@ -127,6 +167,20 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({"results": results, "passed": passed}, indent=2), encoding="utf-8")
     print(f"\nwrote {out}")
+
+    if args.wandb_run_id:
+        import os as _os
+        if _os.environ.get("WANDB_API_KEY") and cfg.wandb_project:
+            import wandb
+            run = wandb.init(project=cfg.wandb_project, entity=cfg.wandb_entity,
+                             id=args.wandb_run_id, resume="allow")
+            run.log({f"eval/{k}": v for k, v in results.items() if not isinstance(v, dict)})
+            run.log({f"eval/per_flag_f1/{flag}": f1 for flag, (_, _, f1) in per_flag.items()})
+            run.finish()
+            print(f"logged eval/* metrics into W&B run {args.wandb_run_id}")
+        else:
+            print("! --wandb-run-id given but WANDB_API_KEY not set or cfg.wandb_project "
+                 "is null — skipped W&B logging")
 
 
 if __name__ == "__main__":
