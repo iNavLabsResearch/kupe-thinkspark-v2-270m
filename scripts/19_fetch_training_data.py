@@ -87,7 +87,15 @@ def _snapshot_download(repo: str, patterns: list[str], token: str | None, local_
     # limit on big many-file repos — the classic path is slower but doesn't fan out
     # token calls, so it stays under the quota. Fewer workers keeps it there too.
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-    max_workers = int(os.environ.get("HF_FETCH_WORKERS", "4"))
+    # 4 concurrent downloads was needlessly conservative for the classic (non-xet) path
+    # — xet's per-file token endpoint is what actually risked the rate limit, and that's
+    # already disabled above. Real observed cost of staying at 4: a repo with tens of
+    # thousands of tiny audio files (Phase-2's per-clip wav layout) took minutes per
+    # folder — almost entirely per-request round-trip latency, not bandwidth, so more
+    # CONCURRENT requests is the real lever. 429s already retry+backoff+resume (below),
+    # so raising this is safe, not reckless. Override with HF_FETCH_WORKERS if you still
+    # hit rate limits (rare on the classic path) or want to push it even higher.
+    max_workers = int(os.environ.get("HF_FETCH_WORKERS", "32"))
     delay = 30
     for attempt in range(1, 9):  # up to 8 tries; snapshot_download resumes each time
         try:
