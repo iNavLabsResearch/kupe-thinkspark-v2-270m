@@ -41,8 +41,40 @@ python scripts/00_encode_audio.py --audio-dir data/audio --out-dir data/encoded
 python scripts/04_build_frames.py --in data/scenarios/scenarios_all.jsonl \
     --frames-out data/frames/frames_all.jsonl
 ```
+Fetches whichever repo layout is present — the current Parquet-shard layout
+(`data/phase2-shard-*.parquet`) or the older loose per-clip layout — and unpacks either
+into the same local `data/audio/` + `data/scenarios/scenarios_all.jsonl`.
 </Tab>
 </Tabs>
+
+<Warning>
+**Real observed problem, fixed:** the loose per-clip Phase-2 layout (one `.wav` + one
+`.json` per clip, bucketed into 200 folders) took **minutes per folder** to fetch — almost
+entirely per-request round-trip latency across thousands of tiny files, not bandwidth
+(the download itself was also needlessly capped at 4 concurrent files — bumped to 32 by
+default, override with `HF_FETCH_WORKERS`).
+
+The real fix: repack the repo into a handful of self-contained Parquet shards (audio
+bytes + timestamps + the full scenario record embedded per row — no separate files to
+join), same idea as Phase-1's shards. One-time conversion, safe to run on a small CPU box
+(no GPU/Mimi needed — this never touches audio content, just repackages files) since it
+processes the 200 upload folders in bounded batches, one shard at a time, never holding
+more than one batch on disk:
+```bash
+export HF_TOKEN=hf_...
+python scripts/23_repack_phase2_to_parquet.py --dry-run   # see the batch/shard plan first
+python scripts/23_repack_phase2_to_parquet.py             # convert (resumable)
+```
+Verify with `scripts/21_fetch_phase2.py`, then reclaim repo space (deletes only the OLD
+`audio/`/`timestamps/` folders — `scenarios/`, the new `data/*.parquet`, metadata, and
+README are untouched):
+```bash
+python scripts/23_repack_phase2_to_parquet.py --delete-old
+```
+Verified offline with a full round-trip test through the real conversion code: wav bytes,
+timestamps, and scenario records come back byte-exact, and re-fetching is idempotent (no
+duplicate scenario lines).
+</Warning>
 
 ## 2 · Train
 

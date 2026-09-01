@@ -222,39 +222,70 @@ def fetch_phase1(repo: str, token: str | None, args) -> None:
 
 
 def fetch_phase2(repo: str, token: str | None, args) -> None:
+    """Fetches BOTH repo layouts a Phase-2 repo might have: the current Parquet-shard
+    layout (`data/phase2-shard-*.parquet`, from scripts/23_repack_phase2_to_parquet.py —
+    audio bytes + timestamps + the full scenario record embedded per row, far fewer
+    files to fetch) and the older loose per-clip layout (`audio/**/*.wav` +
+    `timestamps/**/*.json` + `scenarios/scenarios_all.jsonl`, from
+    scripts/13_upload_hf.py) — whichever is present. Both land in the exact same local
+    data/audio + data/scenarios layout scripts/00_encode_audio.py / 04_build_frames.py
+    already read."""
     utc_log(f"[phase2] fetching from {repo} ...")
     tmp_dir = ROOT / args.tmp_dir / "phase2_snapshot"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    patterns = ["scenarios/scenarios_all.jsonl", "audio/**/*.wav", "timestamps/**/*.json"]
+    patterns = ["data/phase2-shard-*.parquet", "scenarios/scenarios_all.jsonl",
+               "audio/**/*.wav", "timestamps/**/*.json"]
     snap = _snapshot_download(repo, patterns, token, tmp_dir)
 
-    scenarios_src = snap / "scenarios" / "scenarios_all.jsonl"
-    scenarios_dst = ROOT / "data/scenarios/scenarios_all.jsonl"
-    if scenarios_src.exists():
-        scenarios_dst.parent.mkdir(parents=True, exist_ok=True)
-        if scenarios_dst.exists():
-            utc_log(f"[phase2] {scenarios_dst} already exists — leaving it alone "
-                   f"(delete it first if you want the freshly-fetched version instead)")
-        else:
-            shutil.move(str(scenarios_src), str(scenarios_dst))
-            utc_log(f"[phase2] scenarios -> {scenarios_dst}")
-    else:
-        utc_log(f"[phase2] ! no scenarios/scenarios_all.jsonl in {repo} — this repo predates "
-               f"the full-schema upload (scripts/13_upload_hf.py); only the Dataset Viewer "
-               f"parquet exists there, which is NOT enough to rebuild real training frames "
-               f"(missing `target`/`event_char`). Re-upload with the current 13_upload_hf.py "
-               f"to fix this.")
-
     audio_dir = ROOT / args.audio_dir
+    scenarios_dst = ROOT / "data/scenarios/scenarios_all.jsonl"
+    scenarios_dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # ---- new layout: Parquet shards, unpacked into the same local layout -------------
+    shard_paths = sorted((snap / "data").glob("phase2-shard-*.parquet")) if (snap / "data").exists() else []
+    if shard_paths:
+        from thinkspark.phase2_parquet import unpack_shard_to_local
+        seen_ids: set[str] = set()
+        if scenarios_dst.exists():
+            for line in scenarios_dst.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        seen_ids.add(json.loads(line)["scenario_id"])
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+        n_new = 0
+        with scenarios_dst.open("a", encoding="utf-8") as fh:
+            for shard in shard_paths:
+                n_new += unpack_shard_to_local(shard, audio_dir, fh, seen_ids)
+        utc_log(f"[phase2] {len(shard_paths)} parquet shard(s) unpacked, {n_new} new "
+               f"wav+scenario pairs -> {audio_dir}")
+
+    # ---- older layout: loose .wav + .json + scenarios_all.jsonl ----------------------
+    scenarios_src = snap / "scenarios" / "scenarios_all.jsonl"
+    if scenarios_src.exists() and not scenarios_dst.exists():
+        shutil.move(str(scenarios_src), str(scenarios_dst))
+        utc_log(f"[phase2] scenarios (legacy layout) -> {scenarios_dst}")
+    elif scenarios_src.exists():
+        utc_log(f"[phase2] {scenarios_dst} already exists — leaving it alone "
+               f"(delete it first if you want the freshly-fetched version instead)")
+    elif not shard_paths:
+        utc_log(f"[phase2] ! no scenarios found in {repo} in either layout — this repo "
+               f"predates the full-schema upload; only the Dataset Viewer parquet may "
+               f"exist there, which is NOT enough to rebuild real training frames "
+               f"(missing `target`/`event_char`).")
+
     n_wav, skip_wav = _move_flatten(snap / "audio", "*.wav", audio_dir)
-    utc_log(f"[phase2] audio: {n_wav} moved, {skip_wav} already present -> {audio_dir}")
+    if n_wav or skip_wav:
+        utc_log(f"[phase2] audio (legacy layout): {n_wav} moved, {skip_wav} already present -> {audio_dir}")
 
     n_ts, skip_ts = _move_flatten(
         snap / "timestamps", "*.json", audio_dir,
         rename=lambda p: p.stem + ".words.json",
     )
-    utc_log(f"[phase2] timestamps: {n_ts} moved, {skip_ts} already present -> {audio_dir}")
+    if n_ts or skip_ts:
+        utc_log(f"[phase2] timestamps (legacy layout): {n_ts} moved, {skip_ts} already present -> {audio_dir}")
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
     utc_log("[phase2] done — encode + build frames locally next (not uploaded, fast+free):")
