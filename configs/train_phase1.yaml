@@ -37,9 +37,14 @@ lora_r: 16
 lora_alpha: 32
 lora_dropout: 0.05
 
-lambda_vap: 5.0           # L_P1 = L_align + 5.0 * L_vap. Was 0.3, which left VAP at ~0.2%
-                          # of the loss (L_align ~2.5 nats vs L_vap ~0.02) — the VAP head
-                          # was never trained, hence VAD-F1 = 0.000 at eval.
+lambda_vap: 0.05          # DELIBERATELY TINY. The Phase-1 corpus is continuous speech
+                          # clips, so scripts/P1_02_build_frames.py sets speaking_mask =
+                          # all 1s -> the VAP target is a CONSTANT. There is nothing to
+                          # learn, and weighting it heavily (an earlier version of this
+                          # file used 5.0) actively teaches the head to always output
+                          # "speaking", a bias Phase 2 then has to undo. Kept non-zero only
+                          # so the head's weights stay in a sane range. VAP is genuinely
+                          # trained in PHASE 2, where speaking_mask has real negatives.
 vap_horizon: 25           # ~2 s of future 80 ms bins
 
 out_dir: "artifacts/thinkspark-v2-350m/phase1"
