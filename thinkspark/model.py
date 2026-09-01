@@ -169,19 +169,23 @@ class ThinkSparkModel(nn.Module):
     # ------------------------------------------------------------------ #
     def _audio_frame_embeds(self, cb0, prosody, agent_state):
         """Per-frame audio embedding: token + prosody + state + AUDIO segment."""
-        emb = self.audio_embed(cb0)                        # [B, T, H]
-        emb = emb + self.prosody_proj(prosody)             # [B, T, H]
-        emb = emb + self.state_embed(agent_state)          # [B, T, H]
+        # embed_scale goes on the CONTENT (the Mimi codebook token) only, so one audio
+        # frame lands at roughly the magnitude of one scaled text token (~26 on the
+        # 270M). prosody/state/seg stay unscaled: they are MODIFIERS, and should sit at a
+        # few percent of the content, exactly as seg_embed did on the text side before
+        # any of this. (Scaling all four and the text seg_embed too — an earlier version
+        # of this fix — pushed the audio stream to 56.9 vs text 36.5 and, worse, gave the
+        # text segment marker the same magnitude as the word token itself.)
+        emb = self.audio_embed(cb0) * self.embed_scale     # [B, T, H]  content
+        emb = emb + self.prosody_proj(prosody)             # [B, T, H]  modifiers
+        emb = emb + self.state_embed(agent_state)
         seg = torch.full(cb0.shape, SEG_AUDIO, dtype=torch.long, device=cb0.device)
         emb = emb + self.seg_embed(seg)
-        # Match the magnitude of Gemma's own scaled token embeddings (see __init__).
-        return emb * self.embed_scale
+        return emb
 
     def _text_embeds(self, text_ids, seg_ids):
         emb = self.embed_tokens(text_ids)                  # [B, L_text, H] (already scaled)
-        # seg_embed is a plain table, so scale it to sit on the same footing as the
-        # scaled token embedding it is being added to.
-        emb = emb + self.seg_embed(seg_ids) * self.embed_scale
+        emb = emb + self.seg_embed(seg_ids)                # small marker, deliberately unscaled
         return emb
 
     # ------------------------------------------------------------------ #
