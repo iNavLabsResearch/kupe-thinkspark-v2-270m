@@ -99,6 +99,21 @@ class ThinkSparkModel(nn.Module):
         # reuse Gemma's token embedding + lm head (spoken head)
         self.embed_tokens = self.backbone.get_input_embeddings()
 
+        # THE AUDIO/TEXT MAGNITUDE FIX.
+        # Gemma multiplies its token embeddings by sqrt(hidden_size) inside
+        # Gemma3TextScaledWordEmbedding, so `self.embed_tokens(ids)` already comes out
+        # scaled (~26.8 in L2 norm for the 270M). The front-end tables below are plain
+        # nn.Modules at std 0.02 (~0.55), so every audio frame used to enter the residual
+        # stream ~49x WEAKER than a single text token. Measured on a real Phase-1
+        # checkpoint with scripts/27_embed_scale.py: text 26.82 vs audio 0.55 = 48.70x.
+        # The backbone could therefore ignore the audio almost entirely, and it did:
+        # scripts/26_ablate_audio.py showed zeroing the audio cost only +0.088 nats
+        # (+9.2% perplexity). No amount of extra training fixes a scale mismatch.
+        # We now (a) init the new tables to the backbone's OWN embedding std and
+        # (b) apply the same embed_scale, so both streams enter at comparable magnitude.
+        self.embed_scale = self._backbone_embed_scale()
+        self.base_embed_std = self._backbone_embed_std()
+
         # multi-modal front-end
         self.audio_embed = nn.Embedding(codebook_size, hidden)
         self.prosody_proj = nn.Linear(2, hidden)
@@ -112,18 +127,44 @@ class ThinkSparkModel(nn.Module):
         self._init_new_params()
 
     # ------------------------------------------------------------------ #
+    def _backbone_embed_scale(self) -> float:
+        """The multiplier Gemma applies to its token embeddings (1.0 on backbones that
+        don't scale). Read from the embedding module's own `embed_scale` buffer so this
+        tracks the backbone rather than hard-coding sqrt(hidden_size)."""
+        scale = getattr(self.backbone.get_input_embeddings(), "embed_scale", None)
+        if scale is None:
+            return 1.0
+        try:
+            return float(scale)
+        except TypeError:
+            return float(scale.item())
+
+    def _backbone_embed_std(self) -> float:
+        """Std of the backbone's RAW (pre-scale) embedding table — the target init std
+        for our new tables so they match magnitude once embed_scale is applied."""
+        with torch.no_grad():
+            w = self.backbone.get_input_embeddings().weight
+            std = float(w.detach().float().std())
+        return std if std > 0 else 0.02
+
     def _init_new_params(self):
-        for m in (self.audio_embed, self.prosody_proj, self.state_embed,
-                  self.seg_embed, self.control_head, self.vap_head):
+        # Match the backbone's own embedding std (not a hard-coded 0.02) so that, once
+        # embed_scale is applied in _audio_frame_embeds, an audio frame carries about the
+        # same magnitude as a text token. The heads keep the small 0.02 init — they read
+        # hidden states, they do not feed the residual stream.
+        std = getattr(self, "base_embed_std", 0.02)
+        for m in (self.audio_embed, self.prosody_proj, self.state_embed, self.seg_embed):
             for p in m.parameters():
-                if p.dim() > 1:
-                    nn.init.normal_(p, mean=0.0, std=0.02)
-                else:
-                    nn.init.zeros_(p)
+                nn.init.normal_(p, mean=0.0, std=std) if p.dim() > 1 else nn.init.zeros_(p)
+        for m in (self.control_head, self.vap_head):
+            for p in m.parameters():
+                nn.init.normal_(p, mean=0.0, std=0.02) if p.dim() > 1 else nn.init.zeros_(p)
 
     def resize_token_embeddings(self, new_num_tokens: int):
         self.backbone.resize_token_embeddings(new_num_tokens)
         self.embed_tokens = self.backbone.get_input_embeddings()
+        # resize swaps the embedding module — re-read the scale from the new one.
+        self.embed_scale = self._backbone_embed_scale()
 
     # ------------------------------------------------------------------ #
     def _audio_frame_embeds(self, cb0, prosody, agent_state):
@@ -133,11 +174,14 @@ class ThinkSparkModel(nn.Module):
         emb = emb + self.state_embed(agent_state)          # [B, T, H]
         seg = torch.full(cb0.shape, SEG_AUDIO, dtype=torch.long, device=cb0.device)
         emb = emb + self.seg_embed(seg)
-        return emb
+        # Match the magnitude of Gemma's own scaled token embeddings (see __init__).
+        return emb * self.embed_scale
 
     def _text_embeds(self, text_ids, seg_ids):
-        emb = self.embed_tokens(text_ids)                  # [B, L_text, H]
-        emb = emb + self.seg_embed(seg_ids)
+        emb = self.embed_tokens(text_ids)                  # [B, L_text, H] (already scaled)
+        # seg_embed is a plain table, so scale it to sit on the same footing as the
+        # scaled token embedding it is being added to.
+        emb = emb + self.seg_embed(seg_ids) * self.embed_scale
         return emb
 
     # ------------------------------------------------------------------ #
