@@ -61,7 +61,15 @@ DEFAULT_PHASE2_REPO = "anuj-inavlabs/Thinkspark-v2-270m-training-data"
 def _load_scenarios(api, repo: str, token: str | None, tmp_dir: Path) -> dict[str, str]:
     """Downloads scenarios/scenarios_all.jsonl once and returns {scenario_id: raw JSON
     line (str, no trailing newline)} — kept as raw strings (not re-parsed into dicts) so
-    packing is a pure byte-passthrough and this dict is cheaper in memory."""
+    packing is a pure byte-passthrough and this dict is cheaper in memory.
+
+    Falls back to the Dataset Viewer parquet (`data/train-*.parquet` — produced
+    automatically by scripts/13_upload_hf.py's original upload, exists even when the
+    full-schema scenarios_all.jsonl was never uploaded) if the full file isn't there.
+    That parquet has real per-clip metadata (scenario_id, user_text, behaviour,
+    language, domain, gender, prosody, agent_text, duration_s, num_words) but NOT
+    `target`/`event_char` (the focal-loss control-flag timeline) — fine to repack
+    now and fill in later if that full schema ever turns up."""
     from huggingface_hub import hf_hub_download
 
     print("downloading scenarios/scenarios_all.jsonl (full schema, needed once)...")
@@ -70,11 +78,11 @@ def _load_scenarios(api, repo: str, token: str | None, tmp_dir: Path) -> dict[st
                                filename="scenarios/scenarios_all.jsonl",
                                local_dir=str(tmp_dir))
     except Exception as e:
-        print(f"  ! no scenarios/scenarios_all.jsonl on {repo} ({e}) — this repo predates "
-             f"the full-schema upload (scripts/13_upload_hf.py). Every wav will be "
-             f"skipped as orphaned (no scenario record to pair it with) unless you "
-             f"re-upload scenarios/scenarios_all.jsonl to this repo first.")
-        return {}
+        print(f"  ! no scenarios/scenarios_all.jsonl on {repo} ({e}) — falling back to "
+             f"the Dataset Viewer parquet (data/train-*.parquet) for per-clip metadata "
+             f"instead. This repacks scenario_id/user_text/behaviour/... but NOT "
+             f"target/event_char.")
+        return _load_scenarios_from_viewer(api, repo, token, tmp_dir)
     out: dict[str, str] = {}
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -88,6 +96,46 @@ def _load_scenarios(api, repo: str, token: str | None, tmp_dir: Path) -> dict[st
             if sid:
                 out[sid] = line
     print(f"  {len(out)} scenario records loaded")
+    return out
+
+
+def _load_scenarios_from_viewer(api, repo: str, token: str | None, tmp_dir: Path) -> dict[str, str]:
+    """Reads scenario METADATA ONLY from the Dataset Viewer parquet — never the "audio"
+    column, which embeds full audio bytes and can be gigabytes per shard file (real
+    numbers on this repo: ~19k rows, ~7GB of audio). Parquet is columnar, so requesting
+    only the small text columns skips reading the audio column's data pages entirely,
+    keeping this safe on a 4GB-RAM box even though the source file itself is large on
+    disk (streamed there by the download, never held whole in memory)."""
+    import pyarrow.parquet as pq
+    from huggingface_hub import snapshot_download
+
+    files = api.list_repo_files(repo_id=repo, repo_type="dataset", token=token)
+    viewer_files = sorted(f for f in files if f.startswith("data/train-") and f.endswith(".parquet"))
+    if not viewer_files:
+        print("  ! no data/train-*.parquet Viewer files either — no scenario metadata "
+             "available at all; every wav will be skipped as orphaned.")
+        return {}
+
+    print(f"  downloading {len(viewer_files)} Dataset Viewer parquet file(s) for metadata "
+         f"(audio bytes inside them are NOT read into memory)...")
+    viewer_dir = tmp_dir / "viewer_parquet"
+    snapshot_download(repo_id=repo, repo_type="dataset", token=token,
+                      allow_patterns=viewer_files, local_dir=str(viewer_dir),
+                      max_workers=int(os.environ.get("HF_FETCH_WORKERS", "32")))
+
+    meta_cols = ["scenario_id", "user_text", "behaviour", "language", "domain",
+                "gender", "prosody", "agent_text", "duration_s", "num_words"]
+    out: dict[str, str] = {}
+    for vf in viewer_files:
+        local_path = viewer_dir / vf
+        table = pq.read_table(local_path, columns=meta_cols)   # column-pruned — no audio bytes read
+        for row in table.to_pylist():
+            sid = row.get("scenario_id")
+            if sid:
+                out[sid] = json.dumps(row, ensure_ascii=False)
+        local_path.unlink(missing_ok=True)   # free disk immediately, one file at a time
+    print(f"  {len(out)} scenario metadata rows loaded from the Viewer parquet "
+         f"(no target/event_char — audio+text+prosody metadata only)")
     return out
 
 
