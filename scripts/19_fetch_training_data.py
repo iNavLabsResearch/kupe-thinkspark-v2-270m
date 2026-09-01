@@ -234,8 +234,23 @@ def fetch_phase2(repo: str, token: str | None, args) -> None:
     tmp_dir = ROOT / args.tmp_dir / "phase2_snapshot"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    patterns = ["data/phase2-shard-*.parquet", "scenarios/scenarios_all.jsonl",
-               "audio/**/*.wav", "timestamps/**/*.json"]
+    # Check which layout the repo actually has BEFORE downloading anything — if Parquet
+    # shards exist, skip the old audio/**/*.wav + timestamps/**/*.json patterns entirely.
+    # Real bug this fixes: allow_patterns always included both layouts, so on a repo that
+    # still has the old loose files sitting alongside the new shards (e.g. --delete-old
+    # not run yet), snapshot_download pulled thousands of individual wav/json files on
+    # top of the parquet shards that already contain the same data.
+    from huggingface_hub import HfApi
+    api = HfApi(token=token)
+    has_shards = any(f.startswith("data/phase2-shard-") and f.endswith(".parquet")
+                     for f in api.list_repo_files(repo_id=repo, repo_type="dataset", token=token))
+    if has_shards:
+        patterns = ["data/phase2-shard-*.parquet", "scenarios/scenarios_all.jsonl"]
+        utc_log("[phase2] parquet shards found on repo — fetching those + "
+               "scenarios_all.jsonl only, skipping legacy audio/**/*.wav + timestamps/**/*.json")
+    else:
+        patterns = ["scenarios/scenarios_all.jsonl", "audio/**/*.wav", "timestamps/**/*.json"]
+        utc_log("[phase2] no parquet shards on repo — using legacy loose-file layout")
     snap = _snapshot_download(repo, patterns, token, tmp_dir)
 
     audio_dir = ROOT / args.audio_dir
