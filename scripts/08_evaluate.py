@@ -53,6 +53,10 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--frames", required=True)
     ap.add_argument("--report-out", default="reports/eval.json")
+    ap.add_argument("--max-batches", type=int, default=200,
+                    help="cap evaluated batches (0 = all). The full Phase-1 shard set is "
+                        "~170k records / ~2.7k batches, which runs for many minutes with "
+                        "no output; 200 batches is already a tight estimate.")
     ap.add_argument("--wandb-run-id", default=None,
                     help="log these results into an EXISTING W&B run (e.g. the training "
                         "run this checkpoint came from) instead of a new one — pass the "
@@ -69,7 +73,10 @@ def main():
     shards = sorted(glob.glob(args.frames if args.frames.startswith("/") else str(ROOT / args.frames)))
     ds = ThinkSparkDataset(shards, tok, phase=cfg.phase, vap_horizon=cfg.vap_horizon)
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
+                        num_workers=getattr(cfg, "num_workers", 2),
                         collate_fn=make_collate(tok.pad_token_id, phase=cfg.phase))
+    n_batches = len(loader) if not args.max_batches else min(len(loader), args.max_batches)
+    print(f"evaluating {n_batches} batches (batch_size={cfg.batch_size})", flush=True)
 
     C = vocab.NUM_CONTROL_FLAGS
     cm = np.zeros((C, C), dtype=np.int64)
@@ -93,7 +100,11 @@ def main():
     keys = ["text_ids", "text_seg", "text_mask", "cb0", "prosody",
             "agent_state", "audio_mask", "spoken_ids", "spoken_mask"]
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-        for batch in loader:
+        for bi, batch in enumerate(loader):
+            if args.max_batches and bi >= args.max_batches:
+                break
+            if bi % 20 == 0:
+                print(f"  ... {bi}/{n_batches}", flush=True)
             inp = {k: batch[k].to(device) for k in keys if k in batch}
             t0 = time.perf_counter()
             out = model(**inp)
