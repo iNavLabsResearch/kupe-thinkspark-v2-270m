@@ -49,20 +49,27 @@ def main():
     print(f"embed_tokens class: {type(model.embed_tokens).__name__}")
     print("=" * 62)
 
+    # Measure what the BACKBONE ACTUALLY RECEIVES, i.e. the real front-end paths
+    # (_text_embeds / _audio_frame_embeds), NOT the raw tables. An earlier version of
+    # this script compared model.audio_embed(cb) — the unscaled table — against
+    # model.embed_tokens(ids), which Gemma has already scaled, and so kept reporting an
+    # imbalance after the scale fix had in fact landed.
     with torch.no_grad():
         ids = torch.randint(0, 1000, (1, 256))
-        t = model.embed_tokens(ids).float()
+        seg_ids = torch.zeros(1, 256, dtype=torch.long)
+        t = model._text_embeds(ids, seg_ids).float()
         cb = torch.randint(0, model.audio_embed.num_embeddings, (1, 256))
-        a = model.audio_embed(cb).float()
-        pros = model.prosody_proj(torch.randn(1, 256, 2)).float()
-        seg = model.seg_embed(torch.zeros(1, 256, dtype=torch.long)).float()
+        prosody = torch.randn(1, 256, 2)
+        state = torch.zeros(1, 256, dtype=torch.long)
+        a = model._audio_frame_embeds(cb, prosody, state).float()
+        raw_a = model.audio_embed(cb).float()
 
     def n(x): return float(x.norm(dim=-1).mean())
-    nt, na, np_, ns = n(t), n(a), n(pros), n(seg)
-    print(f"  text  embed_tokens : {nt:10.4f}")
-    print(f"  audio audio_embed  : {na:10.4f}")
-    print(f"  prosody_proj       : {np_:10.4f}")
-    print(f"  seg_embed          : {ns:10.4f}")
+    nt, na = n(t), n(a)
+    print(f"  embed_scale        : {model.embed_scale:10.4f}")
+    print(f"  TEXT  stream (_text_embeds)        : {nt:10.4f}")
+    print(f"  AUDIO stream (_audio_frame_embeds) : {na:10.4f}")
+    print(f"    (raw audio_embed table, unscaled : {n(raw_a):.4f})")
     ratio = nt / max(na, 1e-9)
     print(f"\n  text / audio ratio : {ratio:8.2f}x")
     if ratio > 4:
