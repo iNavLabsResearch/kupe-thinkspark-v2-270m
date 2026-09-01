@@ -382,6 +382,8 @@ class Trainer:
         step = self._start_step         # 0 unless resumed via load_checkpoint()
         self._cur_step = step
         self.model.train()
+        self._ema_step_ms = None        # EMA of wall-clock time per optimizer step
+        t_prev = time.perf_counter()
         for epoch in range(self._start_epoch, cfg.epochs):
             self._cur_epoch = epoch
             if self.ddp and self.loader.sampler is not None:
@@ -413,6 +415,15 @@ class Trainer:
                     step += 1
                     self._cur_step = step
 
+                    # wall-clock time for THIS optimizer step (fwd+bwd+step+data wait),
+                    # smoothed into an EMA. Kept as pure step time by resetting t_prev
+                    # after eval/save below, so their pauses don't inflate it.
+                    now = time.perf_counter()
+                    dt_ms = (now - t_prev) * 1000.0
+                    t_prev = now
+                    self._ema_step_ms = (dt_ms if self._ema_step_ms is None
+                                         else 0.9 * self._ema_step_ms + 0.1 * dt_ms)
+
                     if self._is_main and step % cfg.log_every == 0:
                         # TRUE effective-batch loss: mean over all grad_accum micro-batches
                         # (~64 samples), not one 4-sample micro-batch x grad_accum (the old
@@ -424,8 +435,10 @@ class Trainer:
                     if self._is_main and step % getattr(cfg, "eval_every", 500) == 0:
                         val_avg = self.evaluate(self.val_loader, "val", step)
                         self._track_best(val_avg, step)
+                        t_prev = time.perf_counter()   # don't count eval as step time
                     if self._is_main and step % cfg.save_every == 0:
                         self.save(f"step{step}")
+                        t_prev = time.perf_counter()   # don't count save/upload as step time
                 if self._should_stop:
                     break
             # end-of-epoch validation summary
@@ -442,6 +455,7 @@ class Trainer:
                       f"Evaluate THIS, not final/. **")
             # final held-out TEST eval — the honest generalization number
             self.evaluate(self.test_loader, "test", self._cur_step)
+            self._join_uploads()   # let any background checkpoint uploads finish
             if self._wandb is not None:
                 self._wandb.finish()
         if self.ddp:
@@ -471,11 +485,19 @@ class Trainer:
         total = avg.get("loss", 0.0)
         parts = " ".join(f"{k}={v:.4f}" for k, v in avg.items() if k != "loss")
         self._loss_hist.append(total)
+        ms = getattr(self, "_ema_step_ms", None)
+        tstr = ""
+        if ms:
+            sps = 1000.0 / ms if ms > 0 else 0.0
+            eta_s = (self.total_steps - step) * ms / 1000.0
+            tstr = f" {ms:.0f}ms/step ({sps:.2f} it/s, eta {eta_s/60:.0f}m)"
         print(f"[P{self.cfg.phase}] epoch {epoch} step {step}/{self.total_steps} "
-              f"lr={lr:.2e} loss={total:.4f} {parts}")
+              f"lr={lr:.2e} loss={total:.4f} {parts}{tstr}")
         _maybe_plot(self._loss_hist)
         # W&B: true train loss + every component + lr + epoch, charted live.
         metrics = {"train/loss": total, "train/lr": lr, "train/epoch": epoch}
+        if ms:
+            metrics["train/ms_per_step"] = ms
         for k, v in avg.items():
             if k != "loss":
                 metrics[f"train/{k}"] = v
@@ -486,10 +508,14 @@ class Trainer:
         ckpt_dir = self.out_dir / tag
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), ckpt_dir / "model.pt")
-        # optimizer state + position, so load_checkpoint() can genuinely CONTINUE (not
-        # just warm-start) — this is what makes resume-from-HF actually pick up where an
-        # interrupted run left off.
-        torch.save(self.opt.state_dict(), ckpt_dir / "opt.pt")
+        # optimizer state (opt.pt, ~2x the model = the biggest file) is ONLY needed to
+        # RESUME a run — and you never resume from best/ (you resume from the latest
+        # step*/final, you *evaluate*/serve best/). Writing + live-uploading it for best/
+        # doubled every best-save's upload for zero benefit, which is what made training
+        # pause after each improvement. So skip it for best/.
+        save_opt = tag != "best"
+        if save_opt:
+            torch.save(self.opt.state_dict(), ckpt_dir / "opt.pt")
         (ckpt_dir / "trainer_state.json").write_text(
             json.dumps({"epoch": getattr(self, "_cur_epoch", 0),
                        "step": getattr(self, "_cur_step", 0),
@@ -502,12 +528,41 @@ class Trainer:
         # (save() is only ever called under `if self._is_main`). A failure here must NOT
         # kill training: the local checkpoint is already safely on disk, and the next
         # save's upload (or a manual push later) will catch up.
+        #
+        # Runs in a BACKGROUND daemon thread so training does NOT block on the upload (the
+        # old synchronous call paused the loop for the full 1.6 GB transfer after every
+        # save). A per-tag lock serializes uploads of the SAME tag (so two rapid best/
+        # saves can't race the same repo path) while letting training race ahead. On exit,
+        # train() joins outstanding uploads so nothing is lost.
         if self.on_checkpoint is not None:
-            try:
-                self.on_checkpoint(tag, ckpt_dir)
-            except Exception as e:
-                print(f"  ! checkpoint upload hook failed for {tag} (training continues, "
-                      f"local checkpoint is safe): {e}")
+            self._spawn_upload(tag, ckpt_dir)
+
+    def _spawn_upload(self, tag: str, ckpt_dir) -> None:
+        import threading
+        if not hasattr(self, "_upload_threads"):
+            self._upload_threads = []
+            self._upload_locks = {}
+        lock = self._upload_locks.setdefault(tag, threading.Lock())
+
+        def _worker():
+            with lock:   # serialize same-tag uploads; different tags upload concurrently
+                try:
+                    self.on_checkpoint(tag, ckpt_dir)
+                except Exception as e:
+                    print(f"  ! checkpoint upload hook failed for {tag} (training "
+                          f"continues, local checkpoint is safe): {e}")
+
+        t = threading.Thread(target=_worker, name=f"upload-{tag}", daemon=True)
+        t.start()
+        # reap finished threads so the list doesn't grow unbounded
+        self._upload_threads = [x for x in self._upload_threads if x.is_alive()]
+        self._upload_threads.append(t)
+
+    def _join_uploads(self) -> None:
+        for t in getattr(self, "_upload_threads", []):
+            if t.is_alive():
+                print(f"  waiting for background upload {t.name} to finish ...")
+                t.join()
 
 
 def _maybe_plot(hist: list[float]):

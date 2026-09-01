@@ -56,7 +56,10 @@ def _newest_local_checkpoint(run_dir: Path) -> Path | None:
     final = run_dir / "final"
     if (final / "model.pt").exists():
         return final
-    steps = [p for p in run_dir.iterdir() if p.is_dir() and (p / "model.pt").exists()]
+    # Exclude best/ — it's an eval/serve artifact saved WITHOUT opt.pt, so resuming from
+    # it would silently drop the optimizer state. Resume from the newest step*/ instead.
+    steps = [p for p in run_dir.iterdir()
+             if p.is_dir() and p.name != "best" and (p / "model.pt").exists()]
     if not steps:
         return None
     return max(steps, key=lambda p: p.stat().st_mtime)
