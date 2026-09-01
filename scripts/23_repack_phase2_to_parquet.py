@@ -53,7 +53,7 @@ ROOT = setup()
 
 from thinkspark.config import env
 from thinkspark.hf_upload import create_commit_with_backoff, ensure_repo
-from thinkspark.phase2_parquet import pack_batch_to_parquet
+from thinkspark.phase2_parquet import pack_rows_streaming
 
 DEFAULT_PHASE2_REPO = "anuj-inavlabs/Thinkspark-v2-270m-training-data"
 
@@ -211,38 +211,48 @@ def repack(repo: str, args) -> None:
 
         wav_files = sorted(batch_dir.glob("audio/*/*.wav"))
         print(f"  {len(wav_files)} wav file(s) downloaded, packing...")
-        rows = []
-        for wav_path in wav_files:
-            sid = wav_path.stem
-            scen_line = scenarios.get(sid)
-            if scen_line is None:
-                missing_scenario += 1
-                continue   # audio with no matching scenario record is unusable, skip
-            ts_path = wav_path.parent.parent.parent / "timestamps" / wav_path.parent.name / f"{sid}.json"
-            ts_text = ts_path.read_text(encoding="utf-8") if ts_path.exists() else ""
-            if not ts_text:
-                missing_ts += 1
-            rows.append({
-                "scenario_id": sid,
-                "wav_bytes": wav_path.read_bytes(),
-                "timestamps_json": ts_text,
-                "scenario_json": scen_line,
-            })
 
-        if not rows:
-            print(f"  ! batch {i}: no usable rows (all missing scenario records?) — skipping upload")
-            shutil.rmtree(batch_dir, ignore_errors=True)
-            continue
+        counts = {"scenario": 0, "ts": 0}
+
+        def _row_iter():
+            # Lazy: each wav's bytes are read right before being handed to the streaming
+            # writer, and dropped again once that chunk is written — never all 1800+
+            # files' bytes held in memory at once (the real cause of the OOM kill).
+            for wav_path in wav_files:
+                sid = wav_path.stem
+                scen_line = scenarios.get(sid)
+                if scen_line is None:
+                    counts["scenario"] += 1
+                    continue   # audio with no matching scenario record is unusable, skip
+                ts_path = (wav_path.parent.parent.parent / "timestamps"
+                          / wav_path.parent.name / f"{sid}.json")
+                ts_text = ts_path.read_text(encoding="utf-8") if ts_path.exists() else ""
+                if not ts_text:
+                    counts["ts"] += 1
+                yield {
+                    "scenario_id": sid,
+                    "wav_bytes": wav_path.read_bytes(),
+                    "timestamps_json": ts_text,
+                    "scenario_json": scen_line,
+                }
 
         shard_path = tmp_dir / f"phase2-shard-{i:05d}.parquet"
-        pack_batch_to_parquet(rows, shard_path)
+        n_written = pack_rows_streaming(_row_iter(), shard_path, chunk_size=args.chunk_size)
+        missing_scenario += counts["scenario"]
+        missing_ts += counts["ts"]
+
+        if not n_written:
+            print(f"  ! batch {i}: no usable rows (all missing scenario records?) — skipping upload")
+            shard_path.unlink(missing_ok=True)
+            shutil.rmtree(batch_dir, ignore_errors=True)
+            continue
 
         print(f"  uploading data/{shard_path.name} ...")
         create_commit_with_backoff(
             api, repo=repo, operations=[
                 CommitOperationAdd(path_in_repo=f"data/{shard_path.name}",
                                    path_or_fileobj=str(shard_path))],
-            commit_message=f"phase2: repack batch {i} ({len(rows)} clips) to parquet",
+            commit_message=f"phase2: repack batch {i} ({n_written} clips) to parquet",
             max_retries=args.max_retries, base_backoff=args.backoff, max_backoff=args.max_backoff,
         )
 
@@ -304,10 +314,15 @@ def delete_old(repo: str, args) -> None:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=DEFAULT_PHASE2_REPO)
-    ap.add_argument("--folders-per-shard", type=int, default=20,
-                    help="bucket folders per batch/shard (default 20 -> ~10 shards from "
-                        "the 200 upload buckets). Lower this on a very small box if disk "
-                        "or memory is still tight; raise it for fewer, bigger shards.")
+    ap.add_argument("--folders-per-shard", type=int, default=10,
+                    help="bucket folders per batch/shard (default 10 -> ~20 shards from "
+                        "the 200 upload buckets). Only affects DOWNLOAD/disk footprint per "
+                        "batch now that packing itself streams in chunks (--chunk-size) — "
+                        "lower this if the download step itself is still tight on disk.")
+    ap.add_argument("--chunk-size", type=int, default=100,
+                    help="rows held in memory at once while packing a shard (default 100 "
+                        "-> well under 1GB even for large wavs). This is what actually "
+                        "fixed the OOM kill; lower it further on a very tight box.")
     ap.add_argument("--tmp-dir", default="data/.phase2_repack_tmp",
                     help="scratch dir — only ever holds ONE batch's files at a time")
     ap.add_argument("--private", action="store_true")

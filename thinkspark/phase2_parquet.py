@@ -25,26 +25,74 @@ from typing import Callable
 _SCHEMA_FIELDS = ("scenario_id", "wav_bytes", "timestamps_json", "scenario_json")
 
 
+_PARQUET_SCHEMA = None
+
+
+def _schema():
+    import pyarrow as pa
+    global _PARQUET_SCHEMA
+    if _PARQUET_SCHEMA is None:
+        _PARQUET_SCHEMA = pa.schema([
+            pa.field("scenario_id", pa.string()),
+            pa.field("wav_bytes", pa.binary()),
+            pa.field("timestamps_json", pa.string()),
+            pa.field("scenario_json", pa.string()),
+        ])
+    return _PARQUET_SCHEMA
+
+
 def pack_batch_to_parquet(rows: list[dict], out_path: Path,
                           log_fn: Callable[[str], None] = print) -> None:
     """rows: [{"scenario_id": str, "wav_bytes": bytes, "timestamps_json": str (may be
     ""), "scenario_json": str}] — `timestamps_json`/`scenario_json` are the RAW original
     file contents, carried through verbatim (not re-parsed/re-serialized), so this is a
-    lossless repack, not a reinterpretation of the schema."""
+    lossless repack, not a reinterpretation of the schema.
+
+    Kept for callers that already hold a small, fully-materialized row list (e.g. tests).
+    For a large batch on a small-RAM box, use pack_rows_streaming instead — this function
+    builds one full pa.Table in memory (a second copy on top of `rows` itself)."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    schema = pa.schema([
-        pa.field("scenario_id", pa.string()),
-        pa.field("wav_bytes", pa.binary()),
-        pa.field("timestamps_json", pa.string()),
-        pa.field("scenario_json", pa.string()),
-    ])
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pylist(rows, schema=schema)
+    table = pa.Table.from_pylist(rows, schema=_schema())
     pq.write_table(table, out_path, compression="zstd")
     log_fn(f"  wrote {out_path.name}: {len(rows)} rows, "
           f"{out_path.stat().st_size / 1e6:.1f}MB")
+
+
+def pack_rows_streaming(row_iter, out_path: Path, chunk_size: int = 100,
+                        log_fn: Callable[[str], None] = print) -> int:
+    """Same output as pack_batch_to_parquet, but never holds more than `chunk_size` rows'
+    wav bytes in memory at once — `row_iter` is any iterable/generator yielding row dicts
+    one at a time (the caller reads each wav file's bytes lazily, right before it's
+    appended to the current chunk). Writes each chunk as its own row-group via
+    ParquetWriter, so peak memory is O(chunk_size), not O(batch size) — the fix for the
+    real OOM-kill observed packing ~1800 rows into one in-memory pa.Table on a 4GB box.
+    Returns the total row count written."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    schema = _schema()
+    writer = pq.ParquetWriter(out_path, schema, compression="zstd")
+    total = 0
+    chunk: list[dict] = []
+    try:
+        for row in row_iter:
+            chunk.append(row)
+            if len(chunk) >= chunk_size:
+                writer.write_table(pa.Table.from_pylist(chunk, schema=schema))
+                total += len(chunk)
+                chunk = []
+        if chunk:
+            writer.write_table(pa.Table.from_pylist(chunk, schema=schema))
+            total += len(chunk)
+    finally:
+        writer.close()
+    log_fn(f"  wrote {out_path.name}: {total} rows, "
+          f"{out_path.stat().st_size / 1e6:.1f}MB")
+    return total
 
 
 def unpack_shard_to_local(shard_path: Path, audio_dir: Path, scenarios_fh,
