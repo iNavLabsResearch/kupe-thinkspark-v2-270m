@@ -71,9 +71,16 @@ def main():
     decode_ms: list[float] = []
     pred_speaking, true_speaking = [], []
 
+    # Training runs every forward pass under bf16 autocast (thinkspark/trainer.py), which
+    # casts activations on the fly — the backbone itself loads bf16 (thinkspark/model.py)
+    # but resize_token_embeddings() above creates the new/expanded embedding rows in
+    # float32, so without autocast here too, hidden_states entering the bf16 attention
+    # layers mismatch dtype (real error: "expected mat1 and mat2 to have the same dtype,
+    # but got: float != c10::BFloat16"). Match training's precision exactly.
+    use_bf16 = device == "cuda"
     keys = ["text_ids", "text_seg", "text_mask", "cb0", "prosody",
             "agent_state", "audio_mask"]
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
         for batch in loader:
             inp = {k: batch[k].to(device) for k in keys}
             t0 = time.perf_counter()
