@@ -76,8 +76,19 @@ class ThinkSparkDataset(Dataset):
 
         add(sp["sys_bos"], self.system_prompt, SEG_SYS)
         add(sp["agent_bos"], rec.get("agent_text", "") or "", SEG_AGENT)
-        # STT partials optional; use the user_text as a rolling partial proxy in training
-        add(sp["stt_bos"], rec.get("user_text", "") or "", SEG_STT)
+        # STT partials.
+        #   PHASE 2: the referee legitimately sees rolling STT partials of what the user
+        #     is saying, so user_text goes in as a proxy for them. Its target is the
+        #     back-channel text in spoken_spans — a DIFFERENT string — so there is no leak.
+        #   PHASE 1: it MUST NOT go in. The Phase-1 objective is ASR-style
+        #     audio -> user_text alignment, and _spoken_tail() below uses that same
+        #     user_text as the TARGET. Feeding it as input too lets the causal spoken tail
+        #     attend straight back to the answer and copy it verbatim: observed
+        #     align 0.88 -> 0.0085 within 60 steps and perplexity pinned at 1.0000, while
+        #     the audio front-end (audio_embed / prosody_proj) received no useful gradient
+        #     at all. That defeats the entire purpose of the alignment phase.
+        stt_text = "" if self.phase == 1 else (rec.get("user_text", "") or "")
+        add(sp["stt_bos"], stt_text, SEG_STT)
         return ids, seg
 
     def _spoken_tail(self, rec) -> list[int]:
