@@ -25,7 +25,7 @@ from _bootstrap import setup
 ROOT = setup()
 
 from thinkspark.config import DataGenConfig
-from thinkspark.mimi_codec import MimiEncoder
+from thinkspark.mimi_codec import MimiEncoder, _read_wav
 
 
 def main():
@@ -36,6 +36,13 @@ def main():
     ap.add_argument("--out-dir", default="data/encoded")
     ap.add_argument("--device", default=None)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--batch-size", type=int, default=32,
+                    help="clips per GPU forward pass via encoder.encode_batch — the real "
+                        "speed fix (one-at-a-time left the GPU mostly idle between tiny "
+                        "launches). Drop this if you OOM on a small GPU.")
+    ap.add_argument("--io-workers", type=int, default=8,
+                    help="threads reading+resampling wav files off disk while the GPU "
+                        "encodes the previous batch (overlaps I/O with compute)")
     args = ap.parse_args()
 
     cfg = DataGenConfig.from_yaml(ROOT / args.config)
@@ -52,24 +59,43 @@ def main():
     if not wavs:
         raise SystemExit(f"no wavs found in {src_dir}")
 
-    encoder = MimiEncoder(repo=cfg.mimi_repo, device=args.device)
-    print(f"encoding {len(wavs)} wavs from {src_dir} with {cfg.mimi_repo}")
+    pending = [w for w in wavs if not (out_dir / f"{w.stem}.npz").exists()]
+    skipped = len(wavs) - len(pending)
 
-    done = failed = skipped = 0
-    for wav in wavs:
-        out_path = out_dir / f"{wav.stem}.npz"
-        if out_path.exists():
-            skipped += 1
-            continue
-        try:
-            enc = encoder.encode_wav_file(str(wav))
-            enc.save(out_path)
-            done += 1
-        except Exception as e:
-            print(f"  ! failed {wav.name}: {e}")
-            failed += 1
-        if done and done % 50 == 0:
-            print(f"  ... {done} encoded (codebook_size={encoder.codebook_size})")
+    encoder = MimiEncoder(repo=cfg.mimi_repo, device=args.device)
+    print(f"encoding {len(pending)} wavs ({skipped} already done) from {src_dir} "
+         f"with {cfg.mimi_repo}, batch_size={args.batch_size}")
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _load(wav_path: Path):
+        wav, sr = _read_wav(str(wav_path))
+        return wav_path, wav, sr
+
+    done = failed = 0
+    with ThreadPoolExecutor(max_workers=args.io_workers) as pool:
+        for i in range(0, len(pending), args.batch_size):
+            chunk = pending[i:i + args.batch_size]
+            loaded = list(pool.map(_load, chunk))  # I/O overlapped across the chunk
+            paths = [p for p, _, _ in loaded]
+            waveforms = [w for _, w, _ in loaded]
+            rates = [sr for _, _, sr in loaded]
+            try:
+                encs = encoder.encode_batch(waveforms, rates)
+                for wav_path, enc in zip(paths, encs):
+                    enc.save(out_dir / f"{wav_path.stem}.npz")
+                done += len(chunk)
+            except Exception as e:
+                print(f"  ! batch at {i} failed ({e}), falling back to one-at-a-time for it")
+                for wav_path, wav, sr in loaded:
+                    try:
+                        enc = encoder.encode_waveform(wav, sr)
+                        enc.save(out_dir / f"{wav_path.stem}.npz")
+                        done += 1
+                    except Exception as e2:
+                        print(f"  ! failed {wav_path.name}: {e2}")
+                        failed += 1
+            print(f"  ... {done}/{len(pending)} encoded (codebook_size={encoder.codebook_size})")
 
     print(f"done: encoded={done} skipped={skipped} failed={failed} -> {out_dir}")
 
