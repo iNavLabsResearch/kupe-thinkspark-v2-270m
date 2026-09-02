@@ -126,6 +126,16 @@ class DataGenConfig:
     # generation sharding
     num_parts: int = 8                    # break generation into N resumable parts
     seed: int = 1234
+    # Namespace for generated scenario_ids. `_scenario_id` in scripts/02 is
+    # md5(job.key | idx), and job.key is (behaviour|language|domain|gender|silence|band)
+    # — deterministic and index-based, so a SECOND corpus generated with the same
+    # behaviours and length band produces byte-identical scenario_ids to the first one.
+    # Those ids name the .wav / .npz files in the SHARED data/audio + data/encoded dirs,
+    # so a colliding top-up would silently overwrite existing clips and give two frame
+    # records the same id. Set a distinct `corpus_tag` on every additive corpus (the
+    # top-up config written by scripts/28_data_audit.py does). Empty = the original
+    # namespace, so existing corpora keep their exact ids.
+    corpus_tag: str = ""
 
     # ---- cost tracking (Section 13 budget) --------------------------------
     # Fill these in for whichever LLM provider/model you actually point llm_model at
@@ -192,6 +202,16 @@ class TrainConfig:
     lambda_vap_p2: float = 0.2          # Phase-2 VAP aux
     focal_gamma: float = 2.0
     vap_horizon: int = 25               # future 80 ms bins for VAP aux (~2 s)
+    # Phase-2 control-head shaping (see thinkspark.frames / thinkspark.losses).
+    ctrl_event_width: float = 0.0       # widen 1-frame control events into windows;
+                                        # 1.0 = the widths in frames._EVENT_WIDTH_FRAMES,
+                                        # 0 = train on the raw point events (old behaviour)
+    ctrl_alpha_power: float = 0.5       # focal alpha ∝ (1/freq)**power; 0.5 = the old
+                                        # 1/sqrt, 0.75 pulls harder on the rare flags
+    ctrl_alpha_max_ratio: float = 0.0   # clamp alpha_max/alpha_min (0 = no clamp)
+    vap_pos_weight: float = 0.0         # BCE pos_weight for the VAP head (0 = off)
+    eval_tolerance_frames: int = 3      # ±frames collar for the tolerant control metric
+                                        # (3 frames = 240 ms, inside the 300 ms budget)
     # io
     out_dir: str = "artifacts/thinkspark-v2-350m"
     log_every: int = 20
@@ -218,6 +238,12 @@ class TrainConfig:
     #                     choice for Phase 2: the total loss there is dominated by the
     #                     text term, so selecting on it picks the best TEXT model, not
     #                     the best REFEREE — which is the thing being evaluated.
+    #   "ctrl_macro_f1_tol" — the same macro F1 but scored with the ±eval_tolerance_frames
+    #                     collar (thinkspark.metrics.tolerant_per_flag_f1). This is the
+    #                     right selector once the corpus is dominated by SINGLE-FRAME
+    #                     events, because exact-frame macro F1 mostly measures whether the
+    #                     model guessed the exact 80 ms frame, not whether it made the
+    #                     right decision.
     best_metric: str = "loss"
     # Weights & Biases (optional) — set wandb_project (or WANDB_PROJECT env) to enable.
     # Needs `pip install wandb` + WANDB_API_KEY in env (or `wandb login`). Logs train/val

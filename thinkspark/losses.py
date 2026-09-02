@@ -25,14 +25,37 @@ from thinkspark import vocab
 
 
 # --------------------------------------------------------------------------- #
-def class_alpha_from_freq(freq: dict[str, int]) -> torch.Tensor:
-    """alpha_c ∝ 1/sqrt(freq_c), normalised to mean 1 (Section 9.1)."""
+def class_alpha_from_freq(freq: dict[str, int], power: float = 0.5,
+                          max_ratio: float = 0.0) -> torch.Tensor:
+    """alpha_c ∝ (1/freq_c)**power, normalised to mean 1 (Section 9.1).
+
+    Two fixes over the original 1/sqrt(freq):
+
+    * `power` is now a knob. sqrt (0.5) is a very gentle correction for the real
+      Phase-2 distribution, where LISTEN is ~71% of frames and each of TURN_END /
+      BARGE_* / COMMIT_LLM / CANCEL_LLM / PREFETCH_LLM / SILENCE_BREAK is ~0.2-0.5%
+      (they are single-frame events — see thinkspark.frames._EVENT_WIDTH_FRAMES).
+      power=0.75 gives the rare decision flags meaningfully more pull; 1.0 is full
+      inverse-frequency and tends to over-fire them.
+    * A class the corpus never contains used to get `max(1, freq)` -> freq 1 -> the
+      LARGEST alpha of all, so an absent flag out-weighted every real one and dragged
+      the mean-1 normalisation with it. Unseen classes now inherit the largest alpha
+      among the flags that ARE present, and contribute nothing if the corpus is empty.
+
+    `max_ratio` (0 = off) clamps alpha_max / alpha_min, so one ultra-rare flag cannot
+    make its own gradient term dwarf the whole loss.
+    """
+    present = {f: n for f, n in freq.items() if n > 0 and f in vocab.CONTROL_FLAG_TO_ID}
     alpha = torch.ones(vocab.NUM_CONTROL_FLAGS, dtype=torch.float32)
+    if not present:
+        return alpha
+    weights = {f: (1.0 / n) ** power for f, n in present.items()}
+    unseen_w = max(weights.values())
     for flag, i in vocab.CONTROL_FLAG_TO_ID.items():
-        f = max(1, freq.get(flag, 1))
-        alpha[i] = 1.0 / math.sqrt(f)
-    alpha = alpha / alpha.mean()
-    return alpha
+        alpha[i] = weights.get(flag, unseen_w)
+    if max_ratio and max_ratio > 1.0:
+        alpha = alpha.clamp(max=float(alpha.min()) * max_ratio)
+    return alpha / alpha.mean()
 
 
 def focal_control_loss(
@@ -67,12 +90,15 @@ def vap_bce_loss(
     vap_logits: torch.Tensor,  # [B, T, H]
     vap_targets: torch.Tensor, # [B, T, H]
     mask: torch.Tensor,        # [B, T]
+    pos_weight: float = 0.0,   # 0 = unweighted
 ) -> torch.Tensor:
     m = mask.unsqueeze(-1).expand_as(vap_targets).bool()
     if m.sum() == 0:
         return vap_logits.sum() * 0.0
+    pw = (torch.tensor(pos_weight, device=vap_logits.device, dtype=vap_logits.dtype)
+          if pos_weight and pos_weight > 0 else None)
     loss = F.binary_cross_entropy_with_logits(
-        vap_logits[m], vap_targets[m], reduction="mean"
+        vap_logits[m], vap_targets[m], reduction="mean", pos_weight=pw
     )
     return loss
 
@@ -126,7 +152,7 @@ class Phase2Loss(nn.Module):
 
     def __init__(self, alpha: torch.Tensor | None = None, gamma: float = 2.0,
                  l_ctrl: float = 1.0, l_txt: float = 0.5, l_vap: float = 0.2,
-                 label_smoothing: float = 0.0):
+                 label_smoothing: float = 0.0, vap_pos_weight: float = 0.0):
         super().__init__()
         self.register_buffer("alpha", alpha if alpha is not None
                              else torch.ones(vocab.NUM_CONTROL_FLAGS))
@@ -136,6 +162,7 @@ class Phase2Loss(nn.Module):
         # effective regularizer against the Phase-2 text head memorizing the synthetic
         # back-channel corpus (a real driver of the val/txt overfit turn-up).
         self.label_smoothing = label_smoothing
+        self.vap_pos_weight = vap_pos_weight
 
     def forward(self, out, batch) -> dict[str, torch.Tensor]:
         l_ctrl = focal_control_loss(
@@ -144,7 +171,8 @@ class Phase2Loss(nn.Module):
         )
         l_txt = spoken_ce_loss(out.lm_logits, batch["spoken_labels"],
                                label_smoothing=self.label_smoothing)
-        l_vap = vap_bce_loss(out.vap_logits, batch["vap"], batch["audio_mask"])
+        l_vap = vap_bce_loss(out.vap_logits, batch["vap"], batch["audio_mask"],
+                             pos_weight=self.vap_pos_weight)
         total = self.l_ctrl * l_ctrl + self.l_txt * l_txt + self.l_vap * l_vap
         return {"loss": total, "ctrl": l_ctrl.detach(),
                 "txt": l_txt.detach(), "vap": l_vap.detach()}

@@ -5,6 +5,10 @@ __pycache__/
 venv/
 .DS_Store
 
+# DhVaani / local TTS smoke-test outputs (fixtures/*.wav stay tracked)
+tests/out_*.wav
+tests/**/__pycache__/
+
 # artifacts / checkpoints
 artifacts/
 reports/

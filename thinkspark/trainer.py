@@ -138,18 +138,31 @@ class Trainer:
             self.loss_fn = Phase1Loss(lambda_vap=cfg.lambda_vap,
                                       label_smoothing=getattr(cfg, "label_smoothing", 0.0))
         else:
-            alpha = class_alpha_from_freq(_class_frequency(shard_paths))
+            freq = _class_frequency(shard_paths)
+            alpha = class_alpha_from_freq(
+                freq,
+                power=getattr(cfg, "ctrl_alpha_power", 0.5),
+                max_ratio=getattr(cfg, "ctrl_alpha_max_ratio", 0.0),
+            )
+            if self._is_main:
+                total = max(1, sum(freq.values()))
+                print("  control-flag frame distribution / focal alpha:")
+                for flag, i in vocab.CONTROL_FLAG_TO_ID.items():
+                    n = freq.get(flag, 0)
+                    print(f"    {flag:<14} {n:>10}  {100.0*n/total:6.3f}%  alpha={alpha[i]:.3f}")
             self.loss_fn = Phase2Loss(alpha=alpha, gamma=cfg.focal_gamma,
                                       l_ctrl=cfg.lambda_ctrl, l_txt=cfg.lambda_txt,
                                       l_vap=cfg.lambda_vap_p2,
-                                      label_smoothing=getattr(cfg, "label_smoothing", 0.0))
+                                      label_smoothing=getattr(cfg, "label_smoothing", 0.0),
+                                      vap_pos_weight=getattr(cfg, "vap_pos_weight", 0.0))
         self.loss_fn = self.loss_fn.to(self.device)
 
         # data — split into train / val / test (val + test held OUT of training so their
         # loss is a real generalization signal, not memorized). Deterministic split via a
         # seeded generator so the same held-out sets are used across resumes/DDP ranks.
         full_ds = ThinkSparkDataset(shard_paths, self.tok, phase=cfg.phase,
-                                    seq_len=cfg.seq_len, vap_horizon=cfg.vap_horizon)
+                                    seq_len=cfg.seq_len, vap_horizon=cfg.vap_horizon,
+                                    ctrl_event_width=getattr(cfg, "ctrl_event_width", 0.0))
         n_total = len(full_ds)
         n_val = int(n_total * getattr(cfg, "val_frac", 0.0))
         n_test = int(n_total * getattr(cfg, "test_frac", 0.0))
@@ -282,6 +295,10 @@ class Trainer:
         # a loss that the text term dominates.
         C = vocab.NUM_CONTROL_FLAGS
         cm = np.zeros((C, C), dtype=np.int64) if self.cfg.phase == 2 else None
+        tol_acc = None
+        tol = int(getattr(self.cfg, "eval_tolerance_frames", 3))
+        vap_hit = vap_tot = 0          # frame-wise VAD accuracy of the VAP head @ logit>0
+        vap_tp = vap_fp = vap_fn = 0
         for batch in loader:
             batch = self._to_device(batch)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_bf16):
@@ -290,17 +307,32 @@ class Trainer:
             for k, v in losses.items():
                 if hasattr(v, "item"):
                     sums[k] = sums.get(k, 0.0) + float(v.item())
+            amask = batch["audio_mask"].detach().cpu().numpy()
             if cm is not None:
                 pred = out.control_logits.argmax(-1).detach().cpu().numpy()
-                cm += M.flag_confusion(pred,
-                                       batch["flags"].detach().cpu().numpy(),
-                                       batch["audio_mask"].detach().cpu().numpy())
+                true = batch["flags"].detach().cpu().numpy()
+                cm += M.flag_confusion(pred, true, amask)
+                tol_acc = M.accumulate_tolerant_counts(tol_acc, pred, true, amask,
+                                                       tolerance_frames=tol)
+            # VAD from the VAP head's next-frame logit — tracked EVERY eval so a dead or
+            # collapsing head is visible during training instead of only in 08_evaluate.
+            vl = out.vap_logits[..., 0].float().detach().cpu().numpy()
+            vt = batch["vap"][..., 0].detach().cpu().numpy() > 0.5
+            mb = amask.astype(bool)
+            vp = (vl > 0)[mb]; vt = vt[mb]
+            vap_tp += int((vp & vt).sum()); vap_fp += int((vp & ~vt).sum())
+            vap_fn += int((~vp & vt).sum())
+            vap_hit += int((vp == vt).sum()); vap_tot += int(vt.size)
             n += 1
         if was_training:
             self.model.train()
         if n == 0:
             return {}
         avg = {k: v / n for k, v in sums.items()}
+        if vap_tot:
+            avg["vad_f1"] = M.precision_recall_f1(vap_tp, vap_fp, vap_fn)[2]
+            avg["vad_pred_rate"] = (vap_tp + vap_fp) / vap_tot
+            avg["vad_true_rate"] = (vap_tp + vap_fn) / vap_tot
         if cm is not None and cm.sum() > 0:
             per_flag = M.per_flag_f1(cm)
             avg["ctrl_macro_f1"] = float(np.mean([f1 for _, _, f1 in per_flag.values()]))
@@ -308,6 +340,13 @@ class Trainer:
             self._last_per_flag = per_flag
             self._wandb_log({f"{split}/f1/{flag}": f1
                              for flag, (_, _, f1) in per_flag.items()}, step)
+            if tol_acc is not None:
+                per_flag_tol = M.tolerant_f1_from_counts(tol_acc)
+                avg["ctrl_macro_f1_tol"] = float(
+                    np.mean([f1 for _, _, f1 in per_flag_tol.values()]))
+                self._last_per_flag_tol = per_flag_tol
+                self._wandb_log({f"{split}/f1_tol/{flag}": f1
+                                 for flag, (_, _, f1) in per_flag_tol.items()}, step)
         pretty = " ".join(f"{k}={v:.4f}" for k, v in avg.items())
         print(f"  [eval:{split}] step {step}: {pretty}")
         self._wandb_log({f"{split}/{k}": v for k, v in avg.items()}, step)
@@ -331,7 +370,10 @@ class Trainer:
         if name not in val_avg:
             return
         raw = float(val_avg[name])
-        higher_better = name.endswith("f1")
+        # "f1" anywhere in the name (ctrl_macro_f1, ctrl_macro_f1_tol, barge_f1, vad_f1)
+        # means higher-is-better. A plain endswith("f1") silently mis-ranked
+        # "ctrl_macro_f1_tol" as lower-is-better and would have saved the WORST checkpoint.
+        higher_better = "f1" in name
         score = -raw if higher_better else raw     # always minimize `score`
         min_delta = getattr(cfg, "early_stop_min_delta", 0.0)
         improved = score < (self._best_val - min_delta)

@@ -31,8 +31,12 @@ warmup_ratio: 0.03
 batch_size: 64            # tail-only LM head keeps VRAM modest; 64 fits comfortably in
                           # 96 GB. Drop to 48/32 only if you OOM.
 grad_accum: 1             # effective batch 64
-epochs: 3                 # upper bound — early stopping usually ends it sooner (val
-                          # minimum last time was ~2 epochs in)
+epochs: 8                 # was 3. Run 20260901-214336 stopped at step ~850 (2 epochs)
+                          # with the rare control flags still climbing (val/f1/TURN_END was
+                          # 0.01 -> 0.13 and still rising at the last eval; SILENCE_BREAK,
+                          # PREFETCH_LLM likewise). Early stopping on ctrl_macro_f1_tol
+                          # ends the run when the referee actually stops improving instead
+                          # of when the (text-dominated) epoch budget runs out.
 precision: "bf16"
 grad_checkpointing: false # OFF on a big GPU = much faster (you have the VRAM)
 frame_drop_aug: 0.05
@@ -62,9 +66,30 @@ lora_dropout: 0.05
 #     20.0*0.008 = 0.16   (~41%)     0.1*2.33 = 0.23   (~59%)
 lambda_ctrl: 20.0         # was 1.0
 lambda_txt: 0.1           # was 0.5 — back-channel text is secondary to the flags
-lambda_vap_p2: 1.0        # was 0.2 — VAP head never fired (VAD-F1 0.000)
+lambda_vap_p2: 1.0        # was 0.2. NOTE: the VAP head reading VAD-F1 0.000 was NOT a
+                          # weighting problem — it was fed the wrong target entirely
+                          # (thinkspark/dataset.py built it from `speaking_mask`, the
+                          # back-channel-TEXT mask, ~0.3% positive). That is fixed; this
+                          # weight now trains a head with a real target behind it.
 focal_gamma: 2.0
 vap_horizon: 25
+
+# ---- control-head shaping (the actual fix for TURN_END/BARGE/*_LLM F1 ~0.1) ----------
+# Every rare flag is laid down on exactly ONE 80 ms frame, so per-frame argmax scoring
+# gives F1=0 to a referee that fires 80 ms early. `ctrl_event_width` widens those point
+# events into short decision WINDOWS during training (widths in
+# thinkspark/frames.py:_EVENT_WIDTH_FRAMES; 1.0 = as listed, e.g. TURN_END -2/+3 frames
+# = a 480 ms window). This both gives the head real positive mass to learn from and
+# stops punishing near-misses.
+ctrl_event_width: 1.0
+# Focal alpha ∝ (1/freq)**power. 0.5 (plain 1/sqrt) barely separates a 71%-of-frames
+# LISTEN from a 0.2% TURN_END; 0.75 does, without the over-firing that full inverse
+# frequency (1.0) causes.
+ctrl_alpha_power: 0.75
+ctrl_alpha_max_ratio: 50.0   # cap alpha_max/alpha_min so one ultra-rare flag can't
+                             # dominate the whole gradient
+vap_pos_weight: 0.0          # real speaking rate is ~0.6-0.8 — no rebalancing needed
+eval_tolerance_frames: 3     # ±240 ms collar for the tolerant control metric
 
 out_dir: "artifacts/thinkspark-v2-350m/phase2"
 log_every: 20
@@ -81,8 +106,12 @@ save_best: true           # write best/ at the best metric — EVALUATE best/, n
 # Select on the REFEREE's quality, not the total loss. The total loss is dominated by the
 # text term even after rebalancing, so "min val loss" picks the best text model. Macro F1
 # over the 11 control flags is what scripts/08_evaluate.py actually grades.
-best_metric: "ctrl_macro_f1"
-early_stop_patience: 6    # stop after 6 evals (=600 steps) with no macro-F1 gain
+# ...and score it with the ±3-frame collar, not exact-frame: exact-frame macro F1 on
+# single-frame events mostly measures whether the model guessed the exact 80 ms tick.
+best_metric: "ctrl_macro_f1_tol"
+early_stop_patience: 10   # was 6. With ~286 steps/epoch and eval_every 100, 6 evals is
+                          # only 600 steps of patience — short enough that a rare flag's
+                          # slow climb can look like a plateau. 10 evals = 1000 steps.
 early_stop_min_delta: 0.0
 
 # W&B

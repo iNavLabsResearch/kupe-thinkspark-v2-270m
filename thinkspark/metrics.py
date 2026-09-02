@@ -57,6 +57,121 @@ def per_flag_f1(cm: np.ndarray) -> dict[str, tuple[float, float, float]]:
     return out
 
 
+def _dilate(x: np.ndarray, tol: int) -> np.ndarray:
+    """Binary dilation of a [B, T] mask by `tol` frames on each side (per row)."""
+    if tol <= 0:
+        return x
+    out = x.copy()
+    for k in range(1, tol + 1):
+        out[:, k:] |= x[:, :-k]
+        out[:, :-k] |= x[:, k:]
+    return out
+
+
+def tolerant_per_flag_f1(pred_flags: np.ndarray, true_flags: np.ndarray,
+                         mask: np.ndarray | None = None,
+                         tolerance_frames: int = 3
+                         ) -> dict[str, tuple[float, float, float]]:
+    """Per-flag P/R/F1 with a ±`tolerance_frames` collar (the standard VAD/diarization
+    scoring convention), computed on [B, T] frame grids.
+
+    `per_flag_f1` above scores exact-frame agreement. For the SUSTAINED flags (LISTEN,
+    HOLD, INCOMPLETE, CONTINUE) that is the right metric — they span many frames. For the
+    point events (TURN_END, BARGE_*, COMMIT/CANCEL/PREFETCH_LLM, SILENCE_BREAK) it is
+    close to meaningless: those labels occupy ONE 80 ms frame, so a referee that fires
+    80 ms early is scored as both a false positive and a false negative and earns F1=0
+    for a decision that is entirely correct in a live call. That single scoring artifact
+    is why run 20260901-214336 reported TURN_END 0.15 / BARGE_SOFT 0.11 / PREFETCH 0.08
+    while every sustained flag sat at 0.87+.
+
+    A ±3 frame collar = ±240 ms, comfortably inside the Section 10 endpoint-latency
+    budget of 300 ms p95, so a hit inside the collar is a genuine hit, not leniency.
+    Report BOTH numbers: exact-frame is the strict view, tolerant is the operational one.
+    """
+    C = vocab.NUM_CONTROL_FLAGS
+    p = np.atleast_2d(pred_flags)
+    t = np.atleast_2d(true_flags)
+    m = (np.atleast_2d(mask).astype(bool) if mask is not None
+         else np.ones_like(p, dtype=bool))
+    out: dict[str, tuple[float, float, float]] = {}
+    for flag, i in vocab.CONTROL_FLAG_TO_ID.items():
+        pi = (p == i) & m
+        ti = (t == i) & m
+        pi_d = _dilate(pi, tolerance_frames) & m
+        ti_d = _dilate(ti, tolerance_frames) & m
+        tp_r = int((ti & pi_d).sum())          # true frames matched by a nearby pred
+        fn = int(ti.sum()) - tp_r
+        tp_p = int((pi & ti_d).sum())          # pred frames justified by a nearby true
+        fp = int(pi.sum()) - tp_p
+        prec = tp_p / (tp_p + fp) if (tp_p + fp) else 0.0
+        rec = tp_r / (tp_r + fn) if (tp_r + fn) else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        out[flag] = (prec, rec, f1)
+    return out
+
+
+def accumulate_tolerant_counts(acc: dict[str, np.ndarray] | None,
+                               pred_flags: np.ndarray, true_flags: np.ndarray,
+                               mask: np.ndarray | None = None,
+                               tolerance_frames: int = 3) -> dict[str, np.ndarray]:
+    """Streaming version of `tolerant_per_flag_f1` — accumulate raw counts batch by batch
+    (a collar cannot be recovered from a summed confusion matrix, so the counts have to
+    be tallied while each batch's frame grid is still in hand). Finish with
+    `tolerant_f1_from_counts`."""
+    C = vocab.NUM_CONTROL_FLAGS
+    if acc is None:
+        acc = {k: np.zeros(C, dtype=np.int64) for k in ("tp_r", "fn", "tp_p", "fp")}
+    p = np.atleast_2d(pred_flags)
+    t = np.atleast_2d(true_flags)
+    m = (np.atleast_2d(mask).astype(bool) if mask is not None
+         else np.ones_like(p, dtype=bool))
+    for i in range(C):
+        pi = (p == i) & m
+        ti = (t == i) & m
+        pi_d = _dilate(pi, tolerance_frames) & m
+        ti_d = _dilate(ti, tolerance_frames) & m
+        tp_r = int((ti & pi_d).sum())
+        tp_p = int((pi & ti_d).sum())
+        acc["tp_r"][i] += tp_r
+        acc["fn"][i] += int(ti.sum()) - tp_r
+        acc["tp_p"][i] += tp_p
+        acc["fp"][i] += int(pi.sum()) - tp_p
+    return acc
+
+
+def tolerant_f1_from_counts(acc: dict[str, np.ndarray]
+                            ) -> dict[str, tuple[float, float, float]]:
+    out: dict[str, tuple[float, float, float]] = {}
+    for flag, i in vocab.CONTROL_FLAG_TO_ID.items():
+        tp_p, fp = int(acc["tp_p"][i]), int(acc["fp"][i])
+        tp_r, fn = int(acc["tp_r"][i]), int(acc["fn"][i])
+        prec = tp_p / (tp_p + fp) if (tp_p + fp) else 0.0
+        rec = tp_r / (tp_r + fn) if (tp_r + fn) else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        out[flag] = (prec, rec, f1)
+    return out
+
+
+def best_threshold_vad(logits: np.ndarray, true_speaking: np.ndarray,
+                       n_steps: int = 41) -> tuple[float, float]:
+    """(best_f1, best_threshold) over a quantile sweep of the VAP next-frame logit.
+
+    The referee ships with whatever threshold this returns, not a hard-coded 0: a head
+    trained on an imbalanced target is calibrated to its own base rate, and forcing
+    prob>0.5 throws away a working detector. Save the threshold beside the checkpoint.
+    """
+    lg = np.asarray(logits).reshape(-1)
+    tp = np.asarray(true_speaking).reshape(-1).astype(bool)
+    if lg.size == 0:
+        return 0.0, 0.0
+    best_f1, best_thr = 0.0, 0.0
+    for thr in np.unique(np.quantile(lg, np.linspace(0.01, 0.99, n_steps))):
+        f1 = vad_f1(lg > thr, tp)
+        if f1 > best_f1:
+            best_f1, best_thr = f1, float(thr)
+    return best_f1, best_thr
+
+
 # --------------------------------------------------------------------------- #
 @dataclass
 class BargeMetrics:

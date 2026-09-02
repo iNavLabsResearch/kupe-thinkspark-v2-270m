@@ -57,6 +57,13 @@ def main():
                     help="cap evaluated batches (0 = all). The full Phase-1 shard set is "
                         "~170k records / ~2.7k batches, which runs for many minutes with "
                         "no output; 200 batches is already a tight estimate.")
+    ap.add_argument("--tolerance-frames", type=int, default=None,
+                    help="±frames collar for the tolerant control metric (default: the "
+                        "config's eval_tolerance_frames). 3 frames = 240 ms.")
+    ap.add_argument("--ctrl-event-width", type=float, default=0.0,
+                    help="widen 1-frame control events in the EVAL targets too. Default 0 "
+                        "= score against the raw point labels (the honest, strict view); "
+                        "set it to the training value only to check train/eval agreement.")
     ap.add_argument("--wandb-run-id", default=None,
                     help="log these results into an EXISTING W&B run (e.g. the training "
                         "run this checkpoint came from) instead of a new one — pass the "
@@ -71,7 +78,10 @@ def main():
     model = load_model(cfg, ckpt, tok, device)
 
     shards = sorted(glob.glob(args.frames if args.frames.startswith("/") else str(ROOT / args.frames)))
-    ds = ThinkSparkDataset(shards, tok, phase=cfg.phase, vap_horizon=cfg.vap_horizon)
+    ds = ThinkSparkDataset(shards, tok, phase=cfg.phase, vap_horizon=cfg.vap_horizon,
+                           ctrl_event_width=args.ctrl_event_width)
+    tol = (args.tolerance_frames if args.tolerance_frames is not None
+           else int(getattr(cfg, "eval_tolerance_frames", 3)))
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
                         num_workers=getattr(cfg, "num_workers", 2),
                         collate_fn=make_collate(tok.pad_token_id, phase=cfg.phase))
@@ -80,6 +90,15 @@ def main():
 
     C = vocab.NUM_CONTROL_FLAGS
     cm = np.zeros((C, C), dtype=np.int64)
+    tol_acc = None
+    # False-barge rate = "the model barged on a look-alike back-channel". It used to be
+    # hard-coded as 0/1 below, i.e. it ALWAYS reported 0.00 and passed its target no
+    # matter what the model did. Count it for real, over the frames of the two behaviours
+    # whose whole point is that barging would be WRONG.
+    bc_barge_frames = bc_total_frames = 0
+    barge_ids = {vocab.CONTROL_FLAG_TO_ID["BARGE_HARD"], vocab.CONTROL_FLAG_TO_ID["BARGE_SOFT"]}
+    lookalike = {"barge_lookalike", "overlap_coop", "backchannel"}
+    behaviours = [r.get("behaviour", "") for r in ds.records]
     decode_ms: list[float] = []
     pred_speaking, true_speaking = [], []
     vap_logit_pos: list = []   # raw next-frame VAP logits (for the threshold sweep)
@@ -113,7 +132,19 @@ def main():
             mask = batch["audio_mask"].numpy()
             if cfg.phase == 2:
                 pred = out.control_logits.argmax(-1).cpu().numpy()   # [B, T]
-                cm += M.flag_confusion(pred, batch["flags"].numpy(), mask)
+                true = batch["flags"].numpy()
+                cm += M.flag_confusion(pred, true, mask)
+                tol_acc = M.accumulate_tolerant_counts(tol_acc, pred, true, mask,
+                                                       tolerance_frames=tol)
+                # false-barge accounting over the hard-negative behaviours
+                lo = bi * cfg.batch_size
+                for r in range(pred.shape[0]):
+                    idx = lo + r
+                    if idx >= len(behaviours) or behaviours[idx] not in lookalike:
+                        continue
+                    mrow = mask[r].astype(bool)
+                    bc_total_frames += int(mrow.sum())
+                    bc_barge_frames += int(np.isin(pred[r][mrow], list(barge_ids)).sum())
             else:
                 # Phase 1 trains no control head — its alignment metric is the ASR-style
                 # CE on user_text (perplexity = e^CE). The control flags would be pure
@@ -129,7 +160,10 @@ def main():
             vap_logit_pos.append(vap_logit[m])
 
     per_flag = M.per_flag_f1(cm)
-    barge = M.barge_metrics(cm, backchannel_frames_pred_barge=0, backchannel_frames_total=1)
+    per_flag_tol = M.tolerant_f1_from_counts(tol_acc) if tol_acc is not None else {}
+    barge = M.barge_metrics(cm,
+                            backchannel_frames_pred_barge=bc_barge_frames,
+                            backchannel_frames_total=max(1, bc_total_frames))
     vad = M.vad_f1(np.concatenate(pred_speaking), np.concatenate(true_speaking)) if pred_speaking else 0.0
 
     # VAD diagnostics — a VAD-F1 of 0.000 is almost always one of two things, and these
@@ -144,10 +178,20 @@ def main():
         best_f1, best_thr = vad, 0.0
         if vap_logit_pos:
             logits_all = np.concatenate(vap_logit_pos)
-            for thr in np.quantile(logits_all, np.linspace(0.02, 0.98, 25)):
-                f1 = M.vad_f1((logits_all > thr), tp_all)
-                if f1 > best_f1:
-                    best_f1, best_thr = f1, float(thr)
+            sweep_f1, sweep_thr = M.best_threshold_vad(logits_all, tp_all)
+            if sweep_f1 > best_f1:
+                best_f1, best_thr = sweep_f1, sweep_thr
+            # Persist the calibrated operating point beside the checkpoint so inference
+            # uses it instead of the hard-coded prob>0.5 (= logit>0) that this script's
+            # headline VAD-F1 assumes. A head trained on an imbalanced target is
+            # calibrated to its own base rate; 0 is only correct by luck.
+            try:
+                (ckpt / "vad_threshold.json").write_text(json.dumps(
+                    {"vad_logit_threshold": round(float(best_thr), 4),
+                     "f1_at_threshold": round(float(best_f1), 4),
+                     "f1_at_zero": round(float(vad), 4)}, indent=2), encoding="utf-8")
+            except OSError:
+                pass
         vad_diag = {
             "true_speaking_rate": float(tp_all.mean()),
             "pred_speaking_rate": float(pp_all.mean()),
@@ -170,6 +214,13 @@ def main():
         results["per_flag_f1"] = {k: round(v[2], 3) for k, v in per_flag.items()}
         results["ctrl_macro_f1"] = round(
             float(np.mean([f1 for _, _, f1 in per_flag.values()])), 3)
+        if per_flag_tol:
+            results["tolerance_frames"] = tol
+            results["per_flag_f1_tol"] = {k: round(v[2], 3) for k, v in per_flag_tol.items()}
+            results["ctrl_macro_f1_tol"] = round(
+                float(np.mean([f1 for _, _, f1 in per_flag_tol.values()])), 3)
+            bt = per_flag_tol["BARGE_HARD"][2], per_flag_tol["BARGE_SOFT"][2]
+            results["barge_f1_tol"] = round(float(np.mean(bt)), 3)
     else:
         # Phase-1 alignment quality. Barge / per-flag are deliberately ABSENT: the
         # control head is untrained in Phase 1, so reporting them would be noise that
@@ -186,7 +237,12 @@ def main():
     print(f"VAD-F1            : {vad:.3f}   (target >= 0.85)  {'PASS' if passed.get('vad_f1') else 'x'}")
     if cfg.phase == 2:
         print(f"Barge-in F1       : {barge.f1:.3f}   (target >= 0.85)  {'PASS' if passed.get('barge_f1') else 'x'}")
-        print(f"Ctrl macro-F1     : {results['ctrl_macro_f1']:.3f}   (checkpoint-selection metric)")
+        print(f"Ctrl macro-F1     : {results['ctrl_macro_f1']:.3f}   (exact-frame)")
+        if per_flag_tol:
+            print(f"Ctrl macro-F1 ±{tol}f : {results['ctrl_macro_f1_tol']:.3f}   "
+                  f"(±{tol * 80} ms collar — the operational number)")
+        print(f"False-barge rate  : {barge.false_barge_rate:.3f}   (target <= 0.05; over "
+              f"{bc_total_frames} frames of look-alike/cooperative behaviours)")
     else:
         print(f"Align CE          : {results['align_ce']}   "
               f"(perplexity {results['align_perplexity']})")
@@ -201,9 +257,14 @@ def main():
                   "head is under-trained (raise lambda_vap_p2) or the >0-logit threshold "
                   "is miscalibrated (use the best-threshold F1 above).")
     if cfg.phase == 2:
-        print("\nper-flag F1:")
+        print(f"\nper-flag F1   (exact-frame | ±{tol}-frame collar):")
         for flag, (p, r, f1) in per_flag.items():
-            print(f"  {flag:<14} P={p:.2f} R={r:.2f} F1={f1:.2f}")
+            if per_flag_tol:
+                pt, rt, ft = per_flag_tol[flag]
+                print(f"  {flag:<14} P={p:.2f} R={r:.2f} F1={f1:.2f}   |   "
+                      f"P={pt:.2f} R={rt:.2f} F1={ft:.2f}")
+            else:
+                print(f"  {flag:<14} P={p:.2f} R={r:.2f} F1={f1:.2f}")
 
     out = ROOT / args.report_out
     out.parent.mkdir(parents=True, exist_ok=True)

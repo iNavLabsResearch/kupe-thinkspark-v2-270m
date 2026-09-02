@@ -25,6 +25,7 @@ import torch
 from torch.utils.data import Dataset
 
 from thinkspark import vocab, frames as frame_lib
+from thinkspark.vad import speaking_from_energy
 from thinkspark.model import SEG_SYS, SEG_AGENT, SEG_STT
 
 DEFAULT_SYSTEM = "You are a polite Indic voice agent. Decide when to listen, hold, interrupt, or back-channel."
@@ -46,7 +47,8 @@ def build_tokenizer(base_model: str, hf_token: str | None = None):
 class ThinkSparkDataset(Dataset):
     def __init__(self, shard_paths: list[str], tokenizer, phase: int = 2,
                  seq_len: int = 1024, vap_horizon: int = 25,
-                 system_prompt: str = DEFAULT_SYSTEM):
+                 system_prompt: str = DEFAULT_SYSTEM,
+                 ctrl_event_width: float = 0.0):
         self.records: list[dict] = []
         for p in shard_paths:
             for line in Path(p).read_text(encoding="utf-8").splitlines():
@@ -58,6 +60,10 @@ class ThinkSparkDataset(Dataset):
         self.seq_len = seq_len
         self.vap_horizon = vap_horizon
         self.system_prompt = system_prompt
+        # Widen single-frame control events into short windows (Phase 2 only). 0 = off,
+        # i.e. the exact point-event labels as stored. See frames.expand_event_flags for
+        # why the default TRAINING config turns this on and why evaluation leaves it off.
+        self.ctrl_event_width = ctrl_event_width
 
     def __len__(self):
         return len(self.records)
@@ -129,8 +135,30 @@ class ThinkSparkDataset(Dataset):
         agent_state = np.array(rec["agent_state"], dtype=np.int64)[:T]
         agent_state = _pad_or_trim(agent_state, T, vocab.AGENT_STATE_TO_ID["IDLE"])
 
-        # VAP targets recomputed from stored speaking info
-        speaking = np.array(rec.get("speaking_mask", [1] * T), dtype=np.float32)[:T]
+        if self.phase == 2 and self.ctrl_event_width > 0:
+            flags = frame_lib.expand_event_flags(flags, self.ctrl_event_width)
+
+        # VAP target: "is the USER SPEAKING in each of the next H frames".
+        #
+        # This used to read `speaking_mask`, which is a DIFFERENT quantity — the frames
+        # carrying back-channel TEXT (thinkspark.frames step 8), ~0.3% positive in a
+        # Phase-2 record. Training the VAP head on it taught "never speaking": the
+        # Phase-2 eval reported true_speak=0.003 / pred_speak=0.000 -> VAD-F1 0.000, with
+        # the threshold sweep finding the head's optimum way out at logit > -3.95.
+        # (Phase 1 scored 0.995 only because its builder writes speaking_mask = all 1s.)
+        #
+        # Resolution order, so ALREADY-BUILT shards are fixed with no regeneration:
+        #   1. rec["vad"]       — written by the updated frames.to_record()
+        #   2. the clip's .npz  — recompute from log-RMS energy at load time (this is the
+        #                         path every existing shard takes; the audio never moved)
+        #   3. speaking_mask    — legacy fallback, correct for Phase-1 (all 1s) records
+        speaking = None
+        if rec.get("vad"):
+            speaking = np.array(rec["vad"], dtype=np.float32)[:T]
+        elif enc_path and Path(enc_path).exists():
+            speaking = speaking_from_energy(energy)      # `energy` loaded above, len T
+        if speaking is None:
+            speaking = np.array(rec.get("speaking_mask", [1] * T), dtype=np.float32)[:T]
         speaking = _pad_or_trim(speaking, T, 0.0)
         vap = _vap_from_speaking(speaking, self.vap_horizon)
 
@@ -146,6 +174,7 @@ class ThinkSparkDataset(Dataset):
             "flags": flags,
             "vap": vap,
             "spoken_ids": spoken_ids,
+            "speaking": speaking,
         }
 
 
@@ -169,6 +198,7 @@ def collate(batch, pad_id: int, phase: int = 2):
     flags = np.full((B, T), vocab.CONTROL_FLAG_TO_ID[vocab.DEFAULT_FLAG], dtype=np.int64)
     Hv = batch[0]["vap"].shape[-1]
     vap = np.zeros((B, T, Hv), dtype=np.float32)
+    speaking = np.zeros((B, T), dtype=np.float32)
 
     spoken_ids = np.full((B, S), pad_id, dtype=np.int64)
     spoken_mask = np.zeros((B, S), dtype=np.int64)
@@ -184,6 +214,7 @@ def collate(batch, pad_id: int, phase: int = 2):
         audio_mask[i, :t] = 1
         flags[i, :t] = b["flags"]
         vap[i, :t] = b["vap"]
+        speaking[i, :t] = b["speaking"]
         if s:
             spoken_ids[i, :s] = b["spoken_ids"]
             spoken_mask[i, :s] = 1
@@ -207,6 +238,7 @@ def collate(batch, pad_id: int, phase: int = 2):
         "audio_mask": torch.from_numpy(audio_mask),
         "flags": torch.from_numpy(flags),
         "vap": torch.from_numpy(vap),
+        "speaking": torch.from_numpy(speaking),
         "spoken_ids": torch.from_numpy(spoken_ids),
         "spoken_mask": torch.from_numpy(spoken_mask),
     }

@@ -111,8 +111,17 @@ def _existing_counts(shard_path: Path) -> dict[str, int]:
     return counts
 
 
-def _scenario_id(job: GenJob, idx: int) -> str:
-    raw = f"{job.key}|{idx}"
+def _scenario_id(job: GenJob, idx: int, corpus_tag: str = "") -> str:
+    """Deterministic id for (job, index) within a corpus namespace.
+
+    `corpus_tag` namespaces the hash so an ADDITIVE corpus (a deficit top-up) cannot
+    reproduce the ids of an existing one. Without it, a second run over the same
+    behaviours/languages/length band emits the identical id sequence, and because the id
+    is the .wav / .npz filename in the shared data/audio + data/encoded directories, the
+    top-up would overwrite the original clips instead of adding to them. Empty tag = the
+    original hash input, so ids already generated are unchanged.
+    """
+    raw = f"{job.key}|{idx}" if not corpus_tag else f"{corpus_tag}|{job.key}|{idx}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -202,6 +211,7 @@ def generate_batch(
     run_id: str,
     stream: GenerationStream,
     global_offset: int = 0,
+    corpus_tag: str = "",
 ) -> list[Scenario]:
     """
     One LLM call requesting `n` scenarios; returns only the ones that pass unit-level
@@ -257,7 +267,7 @@ def generate_batch(
             "length_band": job.length_band,   # so validate() uses the right word budget
         })
         s = Scenario.from_dict(item)
-        s.scenario_id = _scenario_id(job, start_idx + offset)
+        s.scenario_id = _scenario_id(job, start_idx + offset, corpus_tag)
 
         # --- unit-level evaluation (Section 8.5, this ONE scenario) --------------
         res = validate_scenario(s)
@@ -573,7 +583,8 @@ def main():
                 break
             n = min(batch_size, remaining)
             scenarios = generate_batch(client, job, idx, n, db, run_id, stream=stream,
-                                       global_offset=global_offset)
+                                       global_offset=global_offset,
+                                       corpus_tag=getattr(cfg, "corpus_tag", "") or "")
             written = 0
             with lock:
                 for s in scenarios:
