@@ -1,0 +1,164 @@
+---
+title: "Realtime mic inference"
+description: "Listen on the microphone, decide the floor every 80 ms, and log every decision with Mimi + model latency."
+---
+
+Runs the referee against a live microphone instead of a pre-rendered file. Every frame's
+decision is printed as it happens and appended to a JSONL log, with the encode and decode
+time broken out separately so you can see exactly where the lag is.
+
+<Note>
+This is the reference-quality loop — it re-encodes a short trailing window each chunk. It
+is the right tool for testing, demos, and latency measurement. For a shipping full-duplex
+stack you want a KV-cached encoder; see [inference](/commands/inference).
+</Note>
+
+## Install
+
+```bash
+pip install sounddevice
+```
+
+`sounddevice` is the only extra dependency beyond the training requirements. It needs
+PortAudio, which ships with the wheel on macOS and Windows; on Linux install
+`libportaudio2` first.
+
+## Run it
+
+Point at a local checkpoint:
+
+```bash
+python scripts/24_infer_mic.py \
+  --config configs/train_phase2.yaml \
+  --ckpt artifacts/thinkspark-v2-350m/phase2/runs/20260902-103400/step5500
+```
+
+Or pull the checkpoint from the model repo:
+
+```bash
+export HF_TOKEN=hf_...
+python scripts/24_infer_mic.py \
+  --config configs/train_phase2.yaml \
+  --run-id 20260902-103400 --tag step5500
+```
+
+Stop with <kbd>Ctrl</kbd>+<kbd>C</kbd>. The log is flushed after every frame, so an
+interrupt never loses data.
+
+<Warning>
+`--config` defaults to `configs/train_phase2_bigGPU.yaml`. Pass
+`configs/train_phase2.yaml` explicitly if that file is not on your machine.
+</Warning>
+
+## Device selection
+
+The script picks the best available backend automatically — CUDA, then Apple MPS, then
+CPU. It prints the choice at startup. Force one with `CUDA_VISIBLE_DEVICES=""` to test
+the CPU path.
+
+Both the Mimi encoder and the referee run on the same device.
+
+## What you see
+
+Steady-state frames (`LISTEN`, `HOLD`) are suppressed so the stream stays readable. Every
+other decision prints as it happens, along with the orchestrator action it triggers:
+
+```
+opening microphone (device=default, 24000 Hz, 5 frames / 400 ms chunks)
+listening — Ctrl+C to stop
+
+  frame    118 [SPEAKING] -> BARGE_HARD
+      >> BARGE_HARD: stop_tts + send agent-so-far to LLM
+  frame    143 [IDLE] -> TURN_END
+      >> TURN_END: commit LLM -> TTS
+  frame    201 [IDLE] -> SILENCE_BREAK
+      >> TTS: 'ek minute'
+```
+
+## Latency breakdown
+
+The `--timing` flag adds a per-chunk latency line separating the two costs:
+
+```
+  timing  chunk=5 frames | mimi=11.4 ms | model=3.1 ms/frame | budget=400 ms
+```
+
+| stage | typical | what it is |
+|---|---|---|
+| **Chunk buffering** | 400 ms | waiting for enough audio to encode — the dominant cost |
+| **Mimi encode** | ~11 ms | waveform → cb0/energy/f0 tokens for the whole chunk |
+| **Model decode** | ~3 ms/frame | the referee's own forward pass |
+
+The model is not your bottleneck. At 2.9 ms p50 / 4.2 ms p95 it is roughly 20× faster
+than the 80 ms of audio each frame represents. **Buffering is the lag.**
+
+### Cutting the lag
+
+`CHUNK_FRAMES` in `scripts/24_infer_mic.py` controls the tradeoff:
+
+| `CHUNK_FRAMES` | buffering lag | note |
+|---|---|---|
+| 5 (default) | 400 ms | good demo/logging balance |
+| 2 | 160 ms | responsive; more per-chunk encoder overhead |
+| 1 | 80 ms | minimum; encoder overhead starts to dominate |
+
+```bash
+sed -i 's/^CHUNK_FRAMES = 5/CHUNK_FRAMES = 2/' scripts/24_infer_mic.py
+```
+
+Going below 2 rarely helps — you pay fixed encoder setup per chunk, so total wall-clock
+per second of audio goes up even though each individual decision arrives sooner.
+
+## The decision log
+
+Every frame — including the suppressed `LISTEN`/`HOLD` ones — is written to
+`reports/mic_session.jsonl`:
+
+```json
+{"ts": 1788451203.44, "flag": "BARGE_HARD", "spoken": "", "decode_ms": 3.07}
+{"ts": 1788451203.52, "flag": "LISTEN", "spoken": "", "decode_ms": 2.91}
+```
+
+| field | meaning |
+|---|---|
+| `ts` | wall-clock time the decision was made |
+| `flag` | the control flag for this frame |
+| `spoken` | back-channel text, when the model emitted one |
+| `decode_ms` | model decode time for this frame |
+
+Change the path with `--log-out`. Latency percentiles from a session:
+
+```bash
+python -c "
+import json,statistics as s
+d=[json.loads(l)['decode_ms'] for l in open('reports/mic_session.jsonl')]
+q=s.quantiles(d,n=100)
+print(f'n={len(d)} p50={s.median(d):.2f}ms p95={q[94]:.2f}ms max={max(d):.2f}ms')
+"
+```
+
+## Context flags
+
+The referee's decisions depend on what the agent is doing — the same audio means
+different things while the agent is silent versus mid-sentence.
+
+```bash
+python scripts/24_infer_mic.py \
+  --ckpt <path> \
+  --start-state SPEAKING \
+  --agent-text "Your balance is four thousand two hundred rupees"
+```
+
+| flag | purpose |
+|---|---|
+| `--start-state` | `IDLE`, `SPEAKING`, or `THINKING` — the agent's initial state |
+| `--agent-text` | what the agent is currently saying, as context |
+| `--mic-device` | sounddevice index or name; omit for the system default |
+
+Barge-in flags only make sense when the agent state is `SPEAKING`. Start there if you are
+testing interruption handling.
+
+## Languages
+
+The model understands **English, Hindi, and Gujarati**. Speaking anything else during a
+mic session will produce decisions, but they are not validated and should not be trusted.

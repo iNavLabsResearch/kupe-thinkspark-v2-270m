@@ -105,6 +105,8 @@ def main():
                         "this is a standalone listening demo")
     ap.add_argument("--mic-device", default=None, help="sounddevice input index/name (default: system default mic)")
     ap.add_argument("--log-out", default="reports/mic_session.jsonl")
+    ap.add_argument("--timing", action="store_true",
+                    help="print a per-chunk latency line: Mimi encode vs model decode")
     args = ap.parse_args()
 
     try:
@@ -171,7 +173,10 @@ def main():
                 buf = np.concatenate([buf, chunk])
                 while len(buf) >= chunk_samples:
                     piece, buf = buf[:chunk_samples], buf[chunk_samples:]
+                    _t_enc = time.perf_counter()
                     enc = encoder.encode_waveform(piece, _MIMI_RATE)
+                    mimi_ms = (time.perf_counter() - _t_enc) * 1000.0
+                    chunk_decode_ms = 0.0
                     for i in range(enc.num_frames):
                         frame = FrameInput(cb0=int(enc.cb0[i]), energy=float(enc.energy[i]),
                                            f0=float(enc.f0[i]), agent_state=state)
@@ -181,6 +186,12 @@ def main():
                             print(f"  frame {n_frames:>6} [{state}] -> {res.flag}"
                                  + (f"  spoken={res.spoken!r}" if res.spoken else ""))
                         _log(res.flag, res.spoken, res.decode_ms)
+                        chunk_decode_ms += res.decode_ms
+                    if args.timing and enc.num_frames:
+                        print(f"  timing  chunk={enc.num_frames} frames | "
+                             f"mimi={mimi_ms:.1f} ms | "
+                             f"model={chunk_decode_ms / enc.num_frames:.1f} ms/frame | "
+                             f"budget={chunk_samples / _MIMI_RATE * 1000:.0f} ms")
     except KeyboardInterrupt:
         print(f"\nstopped after {n_frames} frames. log: {log_path}")
     finally:

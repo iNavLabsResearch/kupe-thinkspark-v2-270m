@@ -39,6 +39,7 @@
               "commands/training",
               "commands/evaluation",
               "commands/inference",
+              "commands/realtime-mic",
               "commands/monitoring-cost"
             ]
           },
