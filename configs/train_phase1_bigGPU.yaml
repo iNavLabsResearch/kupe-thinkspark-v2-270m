@@ -19,15 +19,16 @@ adam_beta1: 0.9
 adam_beta2: 0.95
 lr: 2.0e-4                 # Phase-1 LR (Section 9.4)
 warmup_ratio: 0.03
-batch_size: 48            # tail-only LM head (see thinkspark/model.py) frees a lot of
+batch_size: 64            # tail-only LM head (see thinkspark/model.py) frees a lot of
                           # VRAM vs computing 256K-vocab logits for the whole sequence, so
-                          # an 80GB H100 fits 48 comfortably now. Drop to 32 if you OOM.
-grad_accum: 1             # effective batch 48 in ONE forward/backward — fewer Python-loop
+                          # a 92GB card fits 64 comfortably. Drop to 48/32 if you OOM.
+                          # 64 is what the known-good 20260901-205340 run used: 165685
+                          # train samples / 64 = 2588 steps per epoch.
+grad_accum: 1             # effective batch 64 in ONE forward/backward — fewer Python-loop
                           # steps than accumulating, so faster wall-clock on a big GPU.
-epochs: 1                 # Phase-1 alignment is 1-2 epochs per the recipe. 1 epoch over
-                          # ~165k samples (~400h audio) is a full, legitimate alignment
-                          # pass — not a shortcut — and keeps this well under an hour on an
-                          # H100. Bump to 2 if you want the extra polish and have the time.
+epochs: 3                 # 2588 steps/epoch x 3 = 7764 total steps — exactly the
+                          # known-good 20260901-205340 run (best val 1.0077 @ step 5176,
+                          # VAD-F1 0.995, audio-ablation delta +5.21 CE).
 precision: "bf16"
 grad_checkpointing: false # OFF on a big GPU = much faster (you have the VRAM)
 frame_drop_aug: 0.05
@@ -59,16 +60,19 @@ vap_horizon: 25
 
 out_dir: "artifacts/thinkspark-v2-350m/phase1"
 log_every: 20
-save_every: 500
+save_every: 2000
 seed: 1234
 ddp: false                # multi-GPU: set true and launch with torchrun --nproc_per_node=N
 
 # eval splits + W&B
 val_frac: 0.02
 test_frac: 0.01
-eval_every: 250
+eval_every: 500
 save_best: true            # keep best/ at the min val loss — warm-start Phase 2 from THIS
-early_stop_patience: 6     # stop after 6 evals with no val gain (0 = off)
+early_stop_patience: 6     # 6 evals x eval_every 500 = 3000 steps of no-gain grace.
+                          # In the known-good run this fired at step 7764 (the natural end
+                          # of epoch 3 anyway) — val had been flat at ~1.018 since 5176,
+                          # so it cost nothing.
 early_stop_min_delta: 0.0
 wandb_project: "kupe-thinkspark-270m"
 wandb_entity: null
